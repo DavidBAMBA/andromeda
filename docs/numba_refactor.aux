@@ -1,0 +1,44 @@
+\relax 
+\providecommand\babel@aux[2]{}
+\@nameuse{bbl@beforestart}
+\catcode `"\active 
+\catcode `<\active 
+\catcode `>\active 
+\@nameuse{es@quoting}
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\babel@aux{spanish}{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Contexto y motivación}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Arquitectura nueva}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Integrador Dormand-Prince en Numba}{1}{subsection.2.1}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {1}Firma del integrador Numba.}{2}{lstlisting.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Pipeline por-pixel unificado}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Esquema del loop de integración adaptativo}{2}{subsection.2.3}\protected@file@percent }
+\newlabel{sec:loop}{{2.3}{2}{Esquema del loop de integración adaptativo}{subsection.2.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Por qué la bisección es necesaria.}{2}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Paralelización con \texttt  {numba.prange}}{2}{subsection.2.4}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {2}Kernel paralelo sobre fotones.}{2}{lstlisting.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Detección de eventos en tiempo real}{3}{subsection.2.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.5.1}Versión antigua: post-procesamiento sobre grilla fija}{3}{subsubsection.2.5.1}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {3}Detección de eventos en la versión vieja.}{3}{lstlisting.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.5.2}Versión nueva: eventos funcionales con refinamiento}{3}{subsubsection.2.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.5.3}Refinamiento por interpolación cúbica de Hermite}{3}{subsubsection.2.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {2.5.4}Por qué el evento de disco es no-terminal}{4}{subsubsection.2.5.4}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {4}Selección del primer cruce dentro del anillo.}{4}{lstlisting.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Nuevos módulos y funciones}{4}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Cambios en módulos existentes}{5}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Generalización de \texttt  {photon\_coords}}{5}{section.5}\protected@file@percent }
+\newlabel{sec:photon_coords}{{5}{5}{Generalización de \texttt {photon\_coords}}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Versión antigua: fórmula cerrada para Kerr}{5}{subsection.5.1}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {5}Cálculo de $k_t$ en la versión vieja.}{5}{lstlisting.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Versión nueva: condición de nulidad exacta}{5}{subsection.5.2}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {6}Cálculo general de $k_t$ en la versión nueva.}{6}{lstlisting.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Impacto físico}{6}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Resultados de performance}{6}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Ventajas de la nueva implementación}{7}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Limitaciones y trabajo pendiente}{7}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Validación}{7}{section.9}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Flujo de un paso del integrador Dormand-Prince adaptativo con detección de eventos inline. La propiedad FSAL (First-Same-As-Last) reutiliza $k_7$ del paso aceptado como $k_1$ del siguiente, reduciendo las evaluaciones de la RHS de 7 a 6 en pasos consecutivos. La bisección opera sobre el mismo interpolante cúbico Hermite construido con $k_1$ y $k_7$, sin evaluar la RHS adicional.}}{9}{figure.1}\protected@file@percent }
+\newlabel{fig:rk45_loop}{{1}{9}{Flujo de un paso del integrador Dormand-Prince adaptativo con detección de eventos inline. La propiedad FSAL (First-Same-As-Last) reutiliza $k_7$ del paso aceptado como $k_1$ del siguiente, reduciendo las evaluaciones de la RHS de 7 a 6 en pasos consecutivos. La bisección opera sobre el mismo interpolante cúbico Hermite construido con $k_1$ y $k_7$, sin evaluar la RHS adicional}{figure.1}{}}
+\gdef \@abspage@last{9}

@@ -73,7 +73,7 @@ acc_structure = thin_disk.structure(blackhole)
 ============================ IMAGE FILENAME ===================================
 ===============================================================================
 '''
-filename = 'Kerr_a_0.9_1920x1080_No_Doppler'
+filename = 'Kerr_a_0.7_1920x1080_No_Doppler_TEST'
 savefig = True
 
 

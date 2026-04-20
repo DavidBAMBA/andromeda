@@ -50,39 +50,60 @@ class detector:
         print()
 
 
-    def photon_coords(self, blackhole, alpha, beta, freq=1): 
+    def photon_coords(self, blackhole, alpha, beta, freq=1):
         '''
-        ===========================================================================
-        Given the initial cartesian coordinates in the image plane (alpha,beta),
-        the distance D to the force center and the inclination angle i, 
-        this function calculates the initial spherical coordinates (r, theta, phi) 
-        and the initial components of the momentum (k_t, k_r, k_theta, k_phi)
-        ===========================================================================
+        Builds a NULL 4-momentum at the screen pixel (alpha, beta) for any
+        stationary, axisymmetric metric (Kerr, Kerr-MOG, Kerr-MOG+quintessence).
+
+        Angular components k_θ, k_φ come from pixel geometry. k_r is taken from
+        the spatial "unit 3-momentum" condition. k_t is then solved so that
+        g^μν k_μ k_ν = 0 exactly (quadratic in k_t), picking the past-pointing
+        root (k_t < 0) appropriate for backward ray tracing.
         '''
-        # Transformation from (Alpha, Beta, D) to (r, theta, phi) 
+        # (alpha, beta, D) → (r, theta, phi) in BL coordinates
         r = sqrt(alpha**2 + beta**2 + self.D**2)
         theta = arccos((beta*self.sin_iota + self.D*self.cos_iota)/r)
         phi = arctan(alpha/(self.D*self.sin_iota - beta*self.cos_iota))
 
-        # Initial position of the photon in spherical coordinates 
-        # (t=0, r, theta, phi)
         xin = [0., r, theta, phi]
 
         # Metric components
         g_tt, g_rr, g_thth, g_phph, g_tph = blackhole.metric(xin)
 
-        # Given a frequency value w0=1, calculates the initial 
-        # 4-momentum of the photon  
-        #w0 =  freq    # Frequency of the photon at infinity
+        # Angular components from pixel geometry (same as original)
         k_th = sqrt(g_thth)*beta/self.D
-        k_ph = - sqrt(g_phph)*alpha/(self.D)
-        k_t = - sqrt(g_phph/(g_tph**2 - g_tt*g_phph)) + alpha*g_tph/(self.D*sqrt(g_phph))
-        k_r =  sqrt(g_rr*(1 - (k_th**2)/g_thth - (k_ph**2)/g_phph ))
-            
-        # Initial 4-momentum in spherical coordinates (kt, kr, ktheta, kphi)
-        k_in = [k_t, k_r, k_th, k_ph]
+        k_ph = -sqrt(g_phph)*alpha/self.D
 
-        return xin + k_in 
+        # Radial component: spatial-unit-norm convention
+        k_r = sqrt(g_rr*(1 - (k_th**2)/g_thth - (k_ph**2)/g_phph))
+
+        # Inverse metric for the null-condition quadratic
+        if hasattr(blackhole, 'inverse_metric'):
+            gtt_, grr_, gthth_, gphph_, gtph_ = blackhole.inverse_metric(xin)
+        else:
+            det_tp = g_tt*g_phph - g_tph**2
+            gtt_   =  g_phph/det_tp
+            gphph_ =  g_tt/det_tp
+            gtph_  = -g_tph/det_tp
+            grr_   = 1.0/g_rr
+            gthth_ = 1.0/g_thth
+
+        # Solve null condition: g^tt k_t² + 2 g^tφ k_φ k_t + spatial_part = 0
+        a_c = gtt_
+        b_c = 2.0 * gtph_ * k_ph
+        c_c = grr_*k_r*k_r + gthth_*k_th*k_th + gphph_*k_ph*k_ph
+        disc = b_c*b_c - 4.0*a_c*c_c
+        if disc < 0:
+            disc = 0.0
+        sq = sqrt(disc)
+        # Pick past-pointing root (k_t < 0). With a_c < 0, the "+ sq" branch
+        # is typically negative; fall back to the other if needed.
+        k_t = (-b_c + sq) / (2.0 * a_c)
+        if k_t > 0:
+            k_t = (-b_c - sq) / (2.0 * a_c)
+
+        k_in = [k_t, k_r, k_th, k_ph]
+        return xin + k_in
  
 
 

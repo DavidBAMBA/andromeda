@@ -6,8 +6,18 @@ emitted from the surface of the disk
 @author: Alexis Larrañaga - 2023
 ===============================================================================
 """
+import numpy as np
 from numpy import cos, sqrt, arccos, pi, log, linspace, min
 from scipy.interpolate import interp1d
+from numba import njit
+
+
+@njit(cache=True)
+def _intensity_nb(r, r_tbl, I_tbl, in_edge, out_edge):
+    if r <= in_edge or r >= out_edge:
+        return 0.0
+    return np.interp(r, r_tbl, I_tbl)
+
 
 class structure:
     def __init__(self, blackhole, corotating=True, R_min=False, R_max=20.):
@@ -26,6 +36,10 @@ class structure:
         ff = self.f(rr)
         ff = ff - min(ff)
         self.energy = interp1d(rr,ff)
+        # Numba hot-path arrays (used by the compiled kernel through
+        # _intensity_nb).
+        self._r_tbl = np.ascontiguousarray(rr, dtype=np.float64)
+        self._I_tbl = np.ascontiguousarray(ff, dtype=np.float64)
 
     def f(self, r):
         a_M = self.a
