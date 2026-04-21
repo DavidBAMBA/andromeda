@@ -216,6 +216,43 @@ class BlackHole:
         return list(_geodesics_nb(q[0], q[1], q[2], q[3],
                                   q[4], q[5], q[6], q[7], self.a))
 
+    def photon_sphere_critical_curve(self, iota, n_points=2000):
+        """
+        Analytical critical curve (shadow boundary) as seen by an observer
+        at polar inclination iota (rad). Returns (alpha, beta) in units of M.
+
+        Derivation: unstable spherical photon orbits at radius r give conserved
+        impact parameters xi_c(r), eta_c(r) (Bardeen 1973). Celestial coords:
+            alpha = -xi_c / sin(iota)
+            beta  = +/- sqrt(eta_c + a^2*cos^2(iota) - xi_c^2*cot^2(iota))
+        r ranges from the prograde to the retrograde equatorial photon orbit.
+        """
+        import numpy as np
+        a = self.a
+        sin_i = np.sin(iota)
+        cos_i = np.cos(iota)
+
+        # Equatorial photon orbit radii (prograde / retrograde)
+        r_pro   = 2.0 * (1.0 + np.cos(2.0/3.0 * np.arccos(-a)))
+        r_retro = 2.0 * (1.0 + np.cos(2.0/3.0 * np.arccos( a)))
+
+        r = np.linspace(r_pro, r_retro, n_points)
+        xi  = -(r**3 - 3*r**2 + a**2*r + a**2) / (a*(r - 1.0))
+        eta =  r**3 * (4*a**2 - r*(r - 3)**2) / (a**2*(r - 1.0)**2)
+
+        alpha   = -xi / sin_i
+        beta_sq = eta + a**2*cos_i**2 - xi**2*(cos_i/sin_i)**2
+
+        valid = beta_sq >= 0.0
+        alpha   = alpha[valid]
+        beta_sq = beta_sq[valid]
+        beta    = np.sqrt(beta_sq)
+
+        # Closed curve: upper half (+beta) then lower half (-beta) reversed
+        alpha_c = np.concatenate([alpha,       alpha[::-1],  [alpha[0]]])
+        beta_c  = np.concatenate([beta,  -beta[::-1],  [beta[0]]])
+        return alpha_c, beta_c
+
 
 
 
