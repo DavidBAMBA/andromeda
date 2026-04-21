@@ -31,8 +31,9 @@ warnings.filterwarnings("ignore")
 
 
 ##### KERR BH
-a = 0.9 # Angular Monmentum
-blackhole = kerr.BlackHole(a)
+a = 0.0 # Angular Monmentum
+blackhole = schwarzschild.BlackHole() # Schwarzschild BH with a=0.0
+#blackhole = kerr.BlackHole(a)
 
 
 ##### NUMERICAL SCHWARZSCHILD BH
@@ -73,7 +74,7 @@ acc_structure = thin_disk.structure(blackhole)
 ============================ IMAGE FILENAME ===================================
 ===============================================================================
 '''
-filename = 'Kerr_a_0.7_1920x1080_No_Doppler_TEST'
+filename = 'schwarzschild_1920x1080_No_Doppler_TEST'
 savefig = True
 
 
