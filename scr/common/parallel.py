@@ -30,9 +30,20 @@ from scr.accretion_structures.thin_disk import _intensity_nb
 # Module-level worker state — populated once per worker via Pool initializer.
 _W = {}
 
+_MODE_CODES = {"no_doppler": 0, "doppler": 1, "shadow": 2}
+
 
 def _has_numba_hooks(blackhole):
     return getattr(blackhole, "_rhs_nb", None) is not None
+
+
+def _resolve_geometry(detector, r_escape, final_lmbda):
+    """Fill in default geometry bounds from detector if not specified."""
+    if r_escape is None:
+        r_escape = 1.1 * detector.D
+    if final_lmbda is None:
+        final_lmbda = 1.5 * detector.D
+    return r_escape, final_lmbda
 
 
 def _init_worker(blackhole, acc_structure, detector, method, rtol, atol, mode,
@@ -72,9 +83,6 @@ def _doppler_inline_nb(fP, I0, blackhole):
     return I0 * g**3
 
 
-_MODE_CODES = {"no_doppler": 0, "doppler": 1, "shadow": 2}
-
-
 def trace_threads_nb(tasks, blackhole, acc_structure, detector,
                      *, n_workers=None, method="auto", rtol=1e-9, atol=1e-11,
                      mode="doppler", progress=True,
@@ -87,10 +95,7 @@ def trace_threads_nb(tasks, blackhole, acc_structure, detector,
     if n_workers is None:
         n_workers = cpu_count()
     n_workers = max(1, n_workers)
-    if r_escape is None:
-        r_escape = 1.1 * detector.D
-    if final_lmbda is None:
-        final_lmbda = 1.5 * detector.D
+    r_escape, final_lmbda = _resolve_geometry(detector, r_escape, final_lmbda)
 
     tasks = list(tasks)
     n_tasks = len(tasks)
@@ -142,8 +147,9 @@ def _integrate_one_nb(task):
     acc = _W["acc_structure"]
     y0 = np.asarray(iC, dtype=np.float64)
 
+    omega_nb = bh._omega_nb if bh._omega_nb is not None else _null_omega_nb
     value = _compute_pixel_nb(
-        bh._rhs_nb, bh._metric_nb, bh._omega_nb,
+        bh._rhs_nb, bh._metric_nb, omega_nb,
         y0, -_W["final_lmbda"],
         float(bh.EH), float(_W["r_escape"]),
         acc._r_tbl, acc._I_tbl, acc.in_edge, acc.out_edge,
@@ -230,10 +236,7 @@ def trace_parallel(tasks, blackhole, acc_structure, detector,
     n_workers = max(1, n_workers)
     if chunksize is None:
         chunksize = _auto_chunksize(n_tasks, n_workers)
-    if r_escape is None:
-        r_escape = 1.1 * detector.D
-    if final_lmbda is None:
-        final_lmbda = 1.5 * detector.D
+    r_escape, final_lmbda = _resolve_geometry(detector, r_escape, final_lmbda)
 
     # Fast path: numba threads (no multiprocessing). Works when the BH
     # exposes numba hooks and thin_disk has the numba arrays.
@@ -311,10 +314,7 @@ def trace_serial(tasks, blackhole, acc_structure, detector,
             mode=mode, progress=progress,
             r_escape=r_escape, final_lmbda=final_lmbda)
 
-    if r_escape is None:
-        r_escape = 1.1 * detector.D
-    if final_lmbda is None:
-        final_lmbda = 1.5 * detector.D
+    r_escape, final_lmbda = _resolve_geometry(detector, r_escape, final_lmbda)
     _init_worker(blackhole, acc_structure, detector,
                  method, rtol, atol, mode, r_escape, final_lmbda)
     image = zeros([detector.x_pixels, detector.y_pixels])
