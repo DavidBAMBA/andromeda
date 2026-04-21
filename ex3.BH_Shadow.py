@@ -45,10 +45,10 @@ blackhole = kerr.BlackHole(a)
 =========================== DETECTOR PARAMETERS ===============================
 ===============================================================================
 '''
-D = 100              # Distance to the BH
+D = 500              # Distance to the BH
 iota = (pi/180)*(85)    # Inclination Angle
 x_side = 25
-x_pixels = 800
+x_pixels = 2000
 
 detector = image_plane.detector(D=D, iota=iota, x_pixels=x_pixels, x_side=x_side, ratio='16:9')
 
@@ -97,5 +97,5 @@ image.create_shadow()
 # Save the image data
 save('images_data/'+filename+'.npy', image.image_data)
 
-# Plot the image
-image.plot_shadow(savefig=savefig, filename=filename)
+# Plot the image with analytical photon sphere overlaid in green
+image.plot_shadow(savefig=savefig, filename=filename, photon_sphere=True)
