@@ -31,9 +31,9 @@ warnings.filterwarnings("ignore")
 
 
 ##### KERR BH
-a = 0.0 # Angular Monmentum
-blackhole = schwarzschild.BlackHole() # Schwarzschild BH with a=0.0
-#blackhole = kerr.BlackHole(a)
+a = 0.7 # Angular Monmentum
+#blackhole = schwarzschild.BlackHole() # Schwarzschild BH with a=0.0
+blackhole = kerr.BlackHole(a)
 
 
 ##### NUMERICAL SCHWARZSCHILD BH
@@ -46,7 +46,7 @@ blackhole = schwarzschild.BlackHole() # Schwarzschild BH with a=0.0
 =========================== DETECTOR PARAMETERS ===============================
 ===============================================================================
 '''
-D = 100              # Distance to the BH
+D = 500              # Distance to the BH
 iota = (pi/180)*(85)    # Inclination Angle
 x_side = 25
 x_pixels = 1920
@@ -74,7 +74,7 @@ acc_structure = thin_disk.structure(blackhole)
 ============================ IMAGE FILENAME ===================================
 ===============================================================================
 '''
-filename = 'schwarzschild_1920x1080_No_Doppler_TEST'
+filename = 'kerr_a_0.7_1920x1080_No_Doppler_TEST'
 savefig = True
 
 
@@ -98,5 +98,5 @@ image.create_image_no_Doppler()
 # Save the image data
 save('images_data/'+filename+'.npy', image.image_data)
 
-# Plot the image
-image.plot(savefig=savefig, filename=filename)
+# Plot the image with analytical photon sphere overlaid in green
+image.plot(savefig=savefig, filename=filename, photon_sphere=True)
