@@ -192,7 +192,7 @@ def integrate_for_H(p, blackhole, acc_structure, detector):
     res = integrate(_rhs(blackhole), p.iC, (0.0, -final_lmbda),
                     method=_INTEGRATOR_METHOD,
                     events=events, rtol=_INTEGRATOR_RTOL,
-                    atol=_INTEGRATOR_ATOL, dense=True)
+                    atol=_INTEGRATOR_ATOL)
     H = Hamiltonian(res.y, blackhole)
     print('Hamiltonian constraint verified: |H_max - H_0 | = ',
           abs(H.max() - H[0]))
@@ -282,43 +282,124 @@ class Image:
         '''Create shadow image in parallel.'''
         print(f"EH radius: {self.blackhole.EH}")
         self._trace(mode="shadow", n_workers=n_workers, chunksize=chunksize)
-        print("\n--- Time of integration : %s seconds/photon ---\n" % (total_time/len(self.photon_list)))
 
     def save_data(self, filename):
         save(filename+'.npy', self.image_data)
 
-    def plot(self, savefig=False, filename=None, cmap='afmhot'):
+    def plot(self, savefig=False, filename=None, cmap='afmhot', photon_sphere=False):
         '''
-        Plots the image of the Black Hole 
+        Plots the image of the Black Hole.
+        photon_sphere=True overlays the analytical critical curve in green
+        and prints a shadow-area accuracy comparison to the console.
         '''
         self.image_data = self.image_data/self.image_data.max()
         ax = plt.figure().add_subplot(aspect='equal')
         ax.imshow(self.image_data.T, cmap = cmap , origin='lower')
-        #ax.set_xlabel(r'$\alpha$')
-        #ax.set_ylabel(r'$\beta$', rotation=0)
+
+        if photon_sphere:
+            self._overlay_photon_sphere(ax)
+
         plt.tick_params(left=False, right=False, labelleft=False,
                         labelbottom=False, bottom=False)
-        
+
         if savefig:
-            plt.savefig('images/'+filename+'.png')
+            plt.savefig('images/'+filename+'.png', dpi=500, bbox_inches='tight')
         plt.show()
-    
-    def plot_shadow(self, savefig=False, filename=None, cmap='gray'):
+
+    def _overlay_photon_sphere(self, ax):
         '''
-        Plots the image of the BH 
+        Overlays the analytical photon-sphere critical curve (shadow boundary)
+        in green on top of ax, and prints a shadow-area precision report.
+
+        The analytical critical curve uses the Bardeen (1973) parametrisation
+        xi_c(r), eta_c(r) for unstable spherical photon orbits.  The numerical
+        shadow area is the count of near-zero-intensity pixels converted to M^2.
+        '''
+        import numpy as np
+
+        if not hasattr(self.blackhole, 'photon_sphere_critical_curve'):
+            print("Warning: photon_sphere_critical_curve not implemented for this BH.")
+            return
+
+        det = self.detector
+        # Recover iota: stored as sin/cos; arcsin is valid for iota in [0, pi/2].
+        iota = np.arcsin(det.sin_iota)
+
+        alpha_c, beta_c = self.blackhole.photon_sphere_critical_curve(iota)
+
+        # Convert analytical (alpha, beta) in M units → pixel indices
+        Nx, Ny = det.x_pixels, det.y_pixels
+        i_c = np.interp(alpha_c, det.alphaRange, np.arange(Nx))
+        j_c = np.interp(beta_c,  det.betaRange,  np.arange(Ny))
+
+        ax.plot(i_c, j_c, color='lime', linewidth=0.9,
+                label='Analytical photon sphere')
+        ax.legend(fontsize=7, loc='upper right')
+
+        # --- Console accuracy report ---
+        # Analytical shadow area via shoelace formula
+        x, y = alpha_c, beta_c
+        area_analytical = 0.5 * abs(np.dot(x[:-1], y[1:]) - np.dot(x[1:], y[:-1]))
+
+        # Numerical shadow area: ONLY the connected dark component that contains
+        # the analytical shadow centroid (otherwise we would also count the
+        # off-disk sky, which is dark because the thin disk has finite extent).
+        from scipy.ndimage import label
+        dark = self.image_data < 1e-6
+        labels, _ = label(dark)
+
+        center_alpha = 0.5 * (alpha_c.max() + alpha_c.min())
+        center_beta  = 0.5 * (beta_c.max()  + beta_c.min())
+        i0 = int(round(np.interp(center_alpha, det.alphaRange, np.arange(Nx))))
+        j0 = int(round(np.interp(center_beta,  det.betaRange,  np.arange(Ny))))
+        i0 = np.clip(i0, 0, Nx - 1)
+        j0 = np.clip(j0, 0, Ny - 1)
+        center_label = labels[i0, j0]
+
+        if center_label == 0:
+            # Center pixel wasn't dark; fall back to the nearest dark pixel.
+            di, dj = np.where(dark)
+            if len(di) == 0:
+                print("Warning: no dark pixels found, cannot measure shadow.")
+                return
+            k = np.argmin((di - i0)**2 + (dj - j0)**2)
+            center_label = labels[di[k], dj[k]]
+
+        shadow_mask = (labels == center_label)
+        pixel_area  = ((det.alphaRange[-1] - det.alphaRange[0]) / (Nx - 1) *
+                       (det.betaRange[-1]  - det.betaRange[0])  / (Ny - 1))
+        area_numerical = np.sum(shadow_mask) * pixel_area
+
+        rel_diff = abs(area_numerical - area_analytical) / area_analytical * 100.0
+
+        print("\n--- Photon Sphere Accuracy ---")
+        print(f"  Analytical shadow area : {area_analytical:.4f} M²")
+        print(f"  Numerical  shadow area : {area_numerical:.4f} M²")
+        print(f"  Relative difference    : {rel_diff:.2f} %")
+        print("  (< ~5% is excellent for a finite-resolution ray-traced image)")
+        print("------------------------------\n")
+    
+    def plot_shadow(self, savefig=False, filename=None, cmap='gray', photon_sphere=False):
+        '''
+        Plots the image of the BH shadow.
+        photon_sphere=True overlays the analytical critical curve in green
+        and prints a rigorous shadow-area accuracy comparison (meaningful
+        here because the image is binary: horizon vs. escape).
         '''
         self.image_data = self.image_data/self.image_data.max()
         ax = plt.figure().add_subplot(aspect='equal')
         ax.imshow(self.image_data.T, cmap = cmap , origin='lower')
+
+        if photon_sphere:
+            self._overlay_photon_sphere(ax)
+
         ax.set_xlabel(r'$\alpha$')
         ax.set_ylabel(r'$\beta$', rotation=0)
         plt.tick_params(left = False, right = False , labelleft = False ,
                         labelbottom = False, bottom = False)
-        #plt.axhline(40, color='black', linewidth=0.5)
-        #plt.axvline(70, color='black', linewidth=0.5)
         plt.grid(which='both')
         if savefig:
-            plt.savefig('images/'+filename+'.png')
+            plt.savefig('images/'+filename+'.png', dpi=300, bbox_inches='tight')
         plt.show()
     
     def plot_contours(self, savefig=False, filename=None, cmap='gray'):
@@ -359,6 +440,7 @@ class Image:
         
         ax.set_xlabel(r'$\lambda$')
         ax.set_ylabel(r'$H$', rotation=0)
+        ax.set_yscale('log')
         ax.set_ylim(-2,2)
         ax.grid(alpha=0.25)
         ax.legend()
