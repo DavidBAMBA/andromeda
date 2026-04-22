@@ -30,7 +30,23 @@ from scr.accretion_structures.thin_disk import _intensity_nb
 # Module-level worker state — populated once per worker via Pool initializer.
 _W = {}
 
-_MODE_CODES = {"no_doppler": 0, "doppler": 1, "shadow": 2}
+_MODE_CODES = {"no_doppler": 0, "doppler": 1, "shadow": 2, "lensing": 3}
+
+
+# Dummy arrays for modes that do not use source-plane profile params.
+_DUMMY_PROFILE_PARAMS = np.zeros(8, dtype=np.float64)
+
+
+def _resolve_profile(acc_structure, mode):
+    '''Return (profile_kind, profile_params, D_LS) for kernel invocation.
+
+    For mode == "lensing", acc_structure is a SourcePlane exposing .profile
+    (with _kind, _params) and .D_LS. For every other mode, return dummies.
+    '''
+    if mode == "lensing":
+        sp = acc_structure
+        return int(sp.profile._kind), sp.profile._params, float(sp.D_LS)
+    return 0, _DUMMY_PROFILE_PARAMS, 0.0
 
 
 def _has_numba_hooks(blackhole):
@@ -112,6 +128,7 @@ def trace_threads_nb(tasks, blackhole, acc_structure, detector,
     mode_code = _MODE_CODES.get(mode, 0)
     omega_nb = blackhole._omega_nb if blackhole._omega_nb is not None \
                                    else _null_omega_nb
+    profile_kind, profile_params, D_LS = _resolve_profile(acc_structure, mode)
 
     numba.set_num_threads(n_workers)
     image = zeros([detector.x_pixels, detector.y_pixels])
@@ -127,7 +144,8 @@ def trace_threads_nb(tasks, blackhole, acc_structure, detector,
         float(blackhole.EH), float(r_escape),
         acc_structure._r_tbl, acc_structure._I_tbl,
         acc_structure.in_edge, acc_structure.out_edge,
-        rtol, atol, mode_code)
+        rtol, atol, mode_code,
+        profile_kind, profile_params, D_LS)
 
     # Scatter results back to image grid.
     for k in range(n_tasks):
@@ -148,12 +166,14 @@ def _integrate_one_nb(task):
     y0 = np.asarray(iC, dtype=np.float64)
 
     omega_nb = bh._omega_nb if bh._omega_nb is not None else _null_omega_nb
+    profile_kind, profile_params, D_LS = _resolve_profile(acc, _W["mode"])
     value = _compute_pixel_nb(
         bh._rhs_nb, bh._metric_nb, omega_nb,
         y0, -_W["final_lmbda"],
         float(bh.EH), float(_W["r_escape"]),
         acc._r_tbl, acc._I_tbl, acc.in_edge, acc.out_edge,
-        _W["rtol"], _W["atol"], _W["mode_code"])
+        _W["rtol"], _W["atol"], _W["mode_code"],
+        profile_kind, profile_params, D_LS)
     return (i, j, value)
 
 

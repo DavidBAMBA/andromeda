@@ -4,7 +4,7 @@ Numba-compiled kernels for geodesic integration and image rendering.
 All functions are @njit — no Python overhead at call time.
 Imported by integrator.py and (indirectly) parallel.py.
 """
-from math import cos as mcos
+from math import cos as mcos, sin as msin, exp as mexp, sqrt as msqrt
 
 import numpy as np
 from numba import njit, prange
@@ -300,6 +300,92 @@ def _solve_photon_nb(rhs, y0, lmbda_end, r_hor, r_esc, rtol, atol):
 
 
 # ============================================================================
+# Asymptotic extrapolation to a source plane (gravitational-lensing mode)
+# ============================================================================
+
+@njit(cache=True, fastmath=False)
+def _eval_profile_nb_kernel(xs, ys, kind, params):
+    '''In-kernel copy of sources.light_profiles._eval_profile_nb.
+
+    Kept here so _compute_pixel_nb remains a single @njit callable without
+    cross-module first-class function plumbing. Must stay in sync with
+    scr/sources/light_profiles.py.
+    '''
+    if kind == 0:       # Gaussian
+        x0 = params[0]; y0p = params[1]
+        sigma = params[2]; I0 = params[3]
+        dx = xs - x0; dy = ys - y0p
+        return I0 * mexp(-0.5 * (dx*dx + dy*dy) / (sigma*sigma))
+    elif kind == 1:     # Sersic
+        x0 = params[0]; y0p = params[1]
+        Re = params[2]; n = params[3]
+        Ie = params[4]; bn = params[5]
+        ell = params[6]; pa = params[7]
+        c = mcos(pa); s = msin(pa)
+        dx = xs - x0; dy = ys - y0p
+        xr =  c*dx + s*dy
+        yr = -s*dx + c*dy
+        q = 1.0 - ell
+        R = msqrt(xr*xr + (yr/q)*(yr/q))
+        if R == 0.0:
+            return Ie * mexp(bn)
+        return Ie * mexp(-bn * ((R/Re) ** (1.0/n) - 1.0))
+    return 0.0
+
+
+@njit(cache=True, fastmath=False)
+def _extrapolate_to_source_plane_nb(rhs, y_final, D_LS):
+    '''Straight-line extrapolation from y_final to the source plane at
+    x = -D_LS.
+
+    Geometry (iota = pi/2): the detector is in parallel-projection mode; the
+    observer is on the +x axis at distance D_L and pixels are arranged on
+    a plane at constant x = D_L, so every photon exits the lens region with
+    v_x < 0 (heading toward the source). The source plane is perpendicular
+    to the observer-lens axis at x = -D_LS. Coordinates on the source plane
+    are (y_src, z_src) returned here as (x_src, y_src) for symmetry with
+    the detector's (alpha, beta) ordering.
+
+    The spacetime is asymptotically flat in the escape region, so
+    straight-line extrapolation in lens-frame Cartesian is accurate.
+
+    The integrator traces backward (lambda decreasing), so rhs(y_final)
+    points opposite to the physical trajectory. We therefore negate the
+    Cartesian velocity to continue the trace onward to the source plane.
+
+    Returns
+    -------
+    ok : bool
+    x_src, y_src : float
+        (y, z) Cartesian on the source plane when ok; (0, 0) otherwise.
+    '''
+    r = y_final[1]; th = y_final[2]; ph = y_final[3]
+    sth = msin(th); cth = mcos(th)
+    sph = msin(ph); cph = mcos(ph)
+
+    xf = r * sth * cph
+    yf = r * sth * sph
+    zf = r * cth
+
+    dq = rhs(y_final)
+    dr_ = dq[1]; dth_ = dq[2]; dph_ = dq[3]
+
+    # Cartesian velocity in the backward-lambda direction (trajectory onward
+    # to the source plane).
+    vx = -(dr_ * sth * cph + r * cth * cph * dth_ - r * sth * sph * dph_)
+    vy = -(dr_ * sth * sph + r * cth * sph * dth_ + r * sth * cph * dph_)
+    vz = -(dr_ * cth       - r * sth     * dth_)
+
+    # Intersect with the source plane at x = -D_LS.
+    if vx >= 0.0:
+        return False, 0.0, 0.0
+    s = (-D_LS - xf) / vx
+    if s < 0.0:
+        return False, 0.0, 0.0
+    return True, yf + s * vy, zf + s * vz
+
+
+# ============================================================================
 # Per-pixel pipeline and parallel render kernel
 # ============================================================================
 
@@ -307,17 +393,29 @@ def _solve_photon_nb(rhs, y0, lmbda_end, r_hor, r_esc, rtol, atol):
 def _compute_pixel_nb(rhs, metric, omega,
                      y0, lmbda_end, r_hor, r_esc,
                      r_tbl, I_tbl, in_edge, out_edge,
-                     rtol, atol, mode_code):
+                     rtol, atol, mode_code,
+                     profile_kind, profile_params, D_LS):
     '''Full per-pixel pipeline: integrate, pick first in-annulus hit,
     return scalar intensity (with Doppler if mode_code==1).
 
-    mode_code: 0=no_doppler, 1=doppler, 2=shadow.
+    mode_code: 0=no_doppler, 1=doppler, 2=shadow, 3=lensing.
+
+    For mode_code == 3, r_tbl/I_tbl/in_edge/out_edge are ignored and
+    (profile_kind, profile_params, D_LS) determine the source-plane brightness.
     '''
     status, y_final, n_hits, y_hits = _solve_photon_nb(
         rhs, y0, lmbda_end, r_hor, r_esc, rtol, atol)
 
     if mode_code == 2:
         return 0.0 if status == 1 else 100.0
+
+    if mode_code == 3:
+        if status != 2:
+            return 0.0
+        ok, xs, ys = _extrapolate_to_source_plane_nb(rhs, y_final, D_LS)
+        if not ok:
+            return 0.0
+        return _eval_profile_nb_kernel(xs, ys, profile_kind, profile_params)
 
     for k in range(n_hits):
         r_hit = y_hits[k, 1]
@@ -337,7 +435,8 @@ def _compute_pixel_nb(rhs, metric, omega,
 def _render_image_nb(rhs, metric, omega,
                      y0_batch, lmbda_end, r_hor, r_esc,
                      r_tbl, I_tbl, in_edge, out_edge,
-                     rtol, atol, mode_code):
+                     rtol, atol, mode_code,
+                     profile_kind, profile_params, D_LS):
     '''Parallel-over-photons render kernel. Each iteration is independent.'''
     n = y0_batch.shape[0]
     values = np.zeros(n)
@@ -346,5 +445,6 @@ def _render_image_nb(rhs, metric, omega,
             rhs, metric, omega,
             y0_batch[idx], lmbda_end, r_hor, r_esc,
             r_tbl, I_tbl, in_edge, out_edge,
-            rtol, atol, mode_code)
+            rtol, atol, mode_code,
+            profile_kind, profile_params, D_LS)
     return values
