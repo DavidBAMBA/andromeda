@@ -98,21 +98,25 @@ lens_light_profile = Sersic(x0=0.0, y0=0.0,
 ================================= STARFIELD ===================================
 ===============================================================================
 '''
-n_stars = 220
+##### Clean simulation look: no starfield, no photographic grain.
+##### For a Hubble-style photographic composite, raise n_stars to ~200 and
+##### set photographic_noise = True below.
+n_stars = 0
+photographic_noise = False
 rng = np.random.default_rng(seed=42)
 
 
 
 '''
 ===============================================================================
-============================ COLOR AND NOISE ==================================
+================================== COLORS =====================================
 ===============================================================================
 '''
 lens_color  = (1.00, 0.70, 0.25)          # orange-red (old elliptical)
 arc_color   = (0.25, 0.55, 1.00)          # blue (starburst background)
-stars_color = (0.90, 0.92, 1.00)          # slight blue-white
+stars_color = (0.90, 0.92, 1.00)          # slight blue-white (if n_stars>0)
 read_noise   = 0.015
-poisson_scale = 500.0                     # higher = cleaner image
+poisson_scale = 500.0                     # used only if photographic_noise
 
 
 
@@ -154,8 +158,9 @@ lens_img = project_profile_on_detector(detector, lens_light_profile)
 if lens_img.max() > 0:
     lens_img /= lens_img.max()
 
-# 3) Starfield
-stars_img = add_starfield(arc_img.shape, n_stars=n_stars, rng=rng)
+# 3) Starfield (empty by default in simulation mode)
+stars_img = (add_starfield(arc_img.shape, n_stars=n_stars, rng=rng)
+             if n_stars > 0 else None)
 
 # 4) RGB composition
 rgb = compose_rgb(lens_img, arc_img, stars_img,
@@ -163,9 +168,10 @@ rgb = compose_rgb(lens_img, arc_img, stars_img,
                   arc_color=arc_color,
                   stars_color=stars_color)
 
-# 5) Photographic noise
-rgb = add_photographic_noise(rgb, read_noise=read_noise,
-                              poisson_scale=poisson_scale, rng=rng)
+# 5) Photographic noise (off in simulation mode)
+if photographic_noise:
+    rgb = add_photographic_noise(rgb, read_noise=read_noise,
+                                  poisson_scale=poisson_scale, rng=rng)
 
 # 6) asinh stretch
 rgb = asinh_stretch(rgb, softening=0.03, max_percentile=99.7)
