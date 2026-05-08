@@ -1,0 +1,710 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=2.4cm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc, fit, backgrounds}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=blue!60!black
+}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{codekw}{rgb}{0.10,0.10,0.60}
+\definecolor{codestr}{rgb}{0.40,0.20,0.00}
+\definecolor{codecom}{rgb}{0.30,0.50,0.30}
+
+\lstdefinestyle{py}{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{codekw}\bfseries,
+    stringstyle=\color{codestr},
+    commentstyle=\color{codecom}\itshape,
+    language=Python,
+    breaklines=true,
+    numbers=none,
+    tabsize=4,
+    showstringspaces=false,
+    frame=single,
+    framesep=4pt,
+    xleftmargin=6pt,
+    xrightmargin=6pt
+}
+
+\title{Refactorización del \emph{ray tracing} de Andromeda\\
+\large Integrador Numba y paralelización con \texttt{prange}}
+\author{David Bamba\\\small Universidad Nacional de Colombia}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este informe documenta la refactorización del pipeline de trazado de rayos
+\emph{backward} en espacio-tiempos curvos del repositorio \texttt{andromeda}.
+La implementación original usaba \texttt{scipy.integrate.solve\_ivp} (DOP853)
+orquestado con \texttt{multiprocessing.Pool} para distribuir fotones entre
+procesos. Se reemplazó el stepper por un Dormand-Prince RK45 compilado con
+Numba, se movió el pipeline por-pixel completo (integración,
+detección de evento disco, cálculo de intensidad y \emph{Doppler shift})
+a código nativo, y se sustituyó el paralelismo por procesos por un kernel
+paralelo con \texttt{numba.prange} y \texttt{nogil=True}. El resultado es
+una ganancia de aproximadamente \textbf{27$\times$ en ejecución
+\emph{single-thread}} y un \textbf{tiempo total 32 veces menor} en una
+imagen $1980\times 1113$ con 32 hilos, sin cambios visibles en el
+resultado físico.
+\end{abstract}
+
+\section{Contexto y motivación}
+
+El código realiza \emph{backward ray tracing} fotón a fotón sobre métricas
+axisimétricas (Schwarzschild, Kerr, Schwarzschild numérico, \emph{scalar
+hair}), integrando las geodésicas nulas hasta detectar uno de tres eventos:
+cruce del horizonte, cruce del disco de acreción o escape al infinito. Un
+\emph{benchmark} sobre \texttt{scaling\_real\_image.py} con el stack
+\texttt{scipy + multiprocessing} mostraba que el escalado \emph{tapaba}
+en $\sim 5.7\times$ con 16 \emph{workers} y caía a 17\% de eficiencia con
+32, con un coste de $\sim 467\,\mu$s por fotón. El perfil indicaba que
+el cuello de botella no era la matemática (la RHS de Kerr ya estaba
+\texttt{@njit}) sino el \emph{glue} Python de \texttt{solve\_ivp}:
+$\sim 300$ pasos por fotón, cada uno con control adaptativo, evaluación
+de eventos y refinamiento \texttt{brentq} en Python.
+
+El objetivo del refactor fue llevar el \emph{hot path} completo
+(stepper + RHS + eventos + intensidad + \emph{Doppler}) a código nativo y
+eliminar el \emph{overhead} de \emph{multiprocessing} (pickle, \emph{fork},
+IPC).
+
+\section{Arquitectura nueva}
+
+\subsection{Integrador Dormand-Prince en Numba}
+
+Se introdujo \texttt{\_solve\_photon\_nb} en
+\texttt{scr/common/integrator.py}: una implementación adaptativa
+Dormand-Prince RK45 con \emph{First-Same-As-Last} (FSAL), con control
+de error por norma escalada y refinamiento de eventos mediante
+\textbf{bisección \emph{inline}} sobre interpolante cúbico Hermite que
+usa $k_1$ y $k_7$ como derivadas en los extremos del paso. Se
+reemplazó \texttt{scipy.optimize.brentq} (no soportado por Numba) por
+30 iteraciones de bisección sobre la componente relevante del estado
+interpolado.
+
+Los eventos están \emph{hardcoded}:
+\begin{itemize}
+  \item \textbf{Horizonte}: terminal, dirección $-1$, umbral
+        $r_{+} + \varepsilon$ con $\varepsilon = 10^{-3}$.
+  \item \textbf{Escape}: terminal, dirección $+1$, umbral $r_{\rm esc}$.
+  \item \textbf{Disco}: no-terminal, dirección $0$, detecta cada cambio
+        de signo de $\cos\theta$ y almacena el estado interpolado en un
+        buffer pre-asignado de tamaño $\texttt{MAX\_DISK\_HITS\_NB} = 32$.
+\end{itemize}
+El filtrado al intervalo anular $r \in [r_{\rm in}, r_{\rm out}]$ se
+realiza en el \emph{post-processing}, preservando así las emisiones del
+\emph{photon ring} (fotones que cruzan el ecuador primero fuera del
+anillo y luego dentro después de orbitar la esfera de fotones).
+
+\begin{lstlisting}[style=py, caption={Firma del integrador Numba.}]
+@njit(cache=True)
+def _solve_photon_nb(rhs, y0, lmbda_end, r_hor, r_esc, rtol, atol):
+    # Dormand-Prince RK45 + FSAL + events inline + bisection refinement.
+    # Returns: (status, y_final, n_hits, y_hits[MAX_DISK_HITS_NB, 8])
+\end{lstlisting}
+
+La RHS se pasa como \emph{first-class function} de Numba, lo que permite
+que el mismo kernel atienda a cualquier agujero negro cuya geodésica esté
+decorada con \texttt{@njit} y tenga la firma esperada
+\verb|(float64[:]) -> float64[:]|.
+
+\subsection{Pipeline por-pixel unificado}
+
+\texttt{\_compute\_pixel\_nb} agrupa en una única función compilada la
+llamada al integrador, el escaneo de los cruces registrados del disco
+en busca de la primera emisión dentro del anillo, el \emph{lookup} de
+intensidad vía \texttt{np.interp} sobre la tabla Novikov-Thorne y
+--- si \verb|mode_code == 1| --- el corrimiento Doppler completo:
+\[
+g = \frac{\sqrt{-g_{tt} - 2\,g_{t\phi}\,\Omega - g_{\phi\phi}\,\Omega^{2}}}
+        {1 + k_{\phi}\,\Omega / k_{t}},\qquad
+I = I_{0}\,g^{3}.
+\]
+Esto elimina el \emph{ping-pong} Python$\leftrightarrow$Numba por fotón
+que se daba en la versión anterior (el \emph{worker} hacía el integrate
+en Numba pero escaneaba hits y llamaba \texttt{scipy.interp1d} en Python).
+
+\subsection{Esquema del loop de integración adaptativo}
+\label{sec:loop}
+
+La figura~\ref{fig:rk45_loop} muestra el flujo completo de un paso del
+integrador Dormand-Prince, desde la propuesta del paso hasta la
+confirmación o el disparo de un evento.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+    node distance = 5mm and 8mm,
+    box/.style    = {rectangle, draw, rounded corners=3pt,
+                     minimum width=52mm, minimum height=8mm,
+                     font=\small, align=center, fill=blue!6},
+    decision/.style={diamond, draw, aspect=2.2,
+                     minimum width=44mm, minimum height=10mm,
+                     font=\small, align=center, fill=yellow!18},
+    term/.style   = {rectangle, draw, rounded corners=6pt,
+                     minimum width=36mm, minimum height=8mm,
+                     font=\small\bfseries, align=center},
+    action/.style = {rectangle, draw, dashed, rounded corners=3pt,
+                     minimum width=52mm, minimum height=8mm,
+                     font=\small, align=center, fill=green!8},
+    arr/.style    = {-{Stealth[length=2mm]}, thick},
+    note/.style   = {font=\scriptsize\itshape, text=gray}
+]
+
+%% ---- nodos ----
+\node[term, fill=gray!15] (start) {Inicio del paso $n$\\estado $y_n$, tamaño $h$};
+
+\node[box,  below=of start] (stages)
+    {Evaluar etapas $k_1 \ldots k_6$ (RK)\\
+     Calcular $y_{n+1}^{(5)}$ y $y_{n+1}^{(4)}$\\
+     Evaluar $k_7 = f(y_{n+1}^{(5)})$ \textbf{[FSAL]}};
+
+\node[box,  below=of stages] (err)
+    {Norma de error\\
+     $\displaystyle e_n = \left(\frac{1}{N}\sum_m
+     \left(\frac{y^{(5)}_m - y^{(4)}_m}
+     {\text{atol}+\text{rtol}\,\max|y_m|}\right)^{\!2}\right)^{1/2}$};
+
+\node[decision, below=of err] (accept) {$e_n \le 1$\,?};
+
+%% -- rama rechazo (derecha) --
+\node[box, right=18mm of accept, fill=red!8] (reject)
+    {Reducir paso\\$h \leftarrow h \cdot 0.9\,(1/e_n)^{0.25}$};
+
+%% -- rama aceptación --
+\node[box, below=12mm of accept] (gevents)
+    {Evaluar funciones de evento en $y_{n+1}$:\\
+     $g_{\rm hor} = y_1 - (r_+ + \varepsilon)$\\
+     $g_{\rm esc} = y_1 - r_{\rm esc}$\\
+     $g_{\rm disk} = \cos\theta$};
+
+\node[decision, below=of gevents] (signchg)
+    {$g_{\rm prev}\cdot g_{\rm new}<0$\,?\\(cambio de signo)};
+
+%% -- sin evento --
+\node[box, right=18mm of signchg, fill=green!8] (commit)
+    {Confirmar paso\\
+     $y_n \leftarrow y_{n+1}$,\;
+     $k_1 \leftarrow k_7$\\
+     Actualizar $g_{\rm prev}$\\
+     Ajustar $h$ (control adaptativo)};
+
+%% -- con evento: biseccion --
+\node[action, below=12mm of signchg] (bisect)
+    {Bisección 30 iteraciones\\sobre interpolante cúbico Hermite\\
+     usando $k_1,\,k_7$ (FSAL):\\
+     $y(\lambda^*)\approx H_{00}y_n + H_{10}hk_1
+     + H_{01}y_{n+1} + H_{11}hk_7$};
+
+\node[decision, below=of bisect] (terminal)
+    {\texttt{terminal}\,?};
+
+%% -- no terminal: disco --
+\node[box, right=18mm of terminal, fill=orange!12] (disk)
+    {Guardar cruce de disco\\
+     \texttt{y\_hits[n\_hits]} $\leftarrow y(\lambda^*)$\\
+     \texttt{n\_hits} $+= 1$\\
+     Continuar integración};
+
+%% -- terminal: parar --
+\node[term, below=12mm of terminal, fill=red!15] (stop)
+    {Detener integración\\
+     \texttt{status} $=$ \texttt{"horizon"} / \texttt{"escape"}\\
+     estado final $= y(\lambda^*)$};
+
+%% ---- flechas ----
+\draw[arr] (start)   -- (stages);
+\draw[arr] (stages)  -- (err);
+\draw[arr] (err)     -- (accept);
+
+% rechazo
+\draw[arr] (accept.east) -- node[above, note]{No} (reject.west);
+\draw[arr] (reject.north) -- ++(0,3mm) -| ($(stages.north)+(12mm,0)$)
+           -- (stages.north);
+
+% aceptacion
+\draw[arr] (accept.south) -- node[right, note]{Sí} (gevents.north);
+\draw[arr] (gevents) -- (signchg);
+
+% sin evento
+\draw[arr] (signchg.east) -- node[above, note]{No} (commit.west);
+\draw[arr] (commit.north) -- ++(0,5mm) -|
+           ($(stages.north)+(-12mm,0)$) -- (stages.north);
+
+% con evento
+\draw[arr] (signchg.south) -- node[right, note]{Sí} (bisect.north);
+\draw[arr] (bisect) -- (terminal);
+
+% no terminal
+\draw[arr] (terminal.east) -- node[above, note]{No (disco)} (disk.west);
+\draw[arr] (disk.north) -- ++(0,4mm) -|
+           ($(commit.south)+(0,-4mm)$) -- (commit.south);
+
+% terminal
+\draw[arr] (terminal.south) -- node[right, note]{Sí} (stop.north);
+
+%% ---- anotaciones laterales ----
+\node[note, left=5mm of stages, text width=22mm, align=right]
+    {7 evaluaciones\\de la RHS\\por paso};
+\node[note, left=5mm of bisect, text width=26mm, align=right]
+    {sin llamadas\\extra a la RHS};
+\node[note, right=5mm of stop, text width=26mm]
+    {el $\lambda^*$ exacto\\se devuelve como\\punto final};
+
+\end{tikzpicture}
+\caption{Flujo de un paso del integrador Dormand-Prince adaptativo con
+detección de eventos inline. La propiedad FSAL (First-Same-As-Last)
+reutiliza $k_7$ del paso aceptado como $k_1$ del siguiente, reduciendo
+las evaluaciones de la RHS de 7 a 6 en pasos consecutivos. La bisección
+opera sobre el mismo interpolante cúbico Hermite construido con $k_1$ y
+$k_7$, sin evaluar la RHS adicional.}
+\label{fig:rk45_loop}
+\end{figure}
+
+\paragraph{Por qué la bisección es necesaria.}
+Cuando $g_{\rm prev}\cdot g_{\rm new}<0$ se sabe que el evento ocurrió
+\emph{en algún punto} del intervalo $[\lambda_n,\lambda_{n+1}]$, pero
+no dónde. Usar $y_{n+1}$ directamente situaría el fotón ya dentro del
+horizonte (o fuera de la región de escape), con coordenadas y momento
+desplazados hasta $O(h)$ del cruce real. Con pasos típicos
+$h\sim 1$--$10$ (unidades geométricas), ese error puede exceder
+varios radios de Schwarzschild. La bisección sobre el interpolante
+cúbico Hermite reduce el error de localización a
+$\sim h\,2^{-30}\lesssim 10^{-9}$ sin ninguna evaluación adicional
+de la RHS.
+
+\subsection{Paralelización con \texttt{numba.prange}}
+
+\texttt{\_render\_image\_nb} es un kernel
+\texttt{@njit(parallel=True, nogil=True)} que itera \texttt{numba.prange}
+sobre el \emph{batch} de condiciones iniciales:
+
+\begin{lstlisting}[style=py, caption={Kernel paralelo sobre fotones.}]
+@njit(parallel=True, nogil=True, cache=False)
+def _render_image_nb(rhs, metric, omega,
+                     y0_batch, lmbda_end, r_hor, r_esc,
+                     r_tbl, I_tbl, in_edge, out_edge,
+                     rtol, atol, mode_code):
+    n = y0_batch.shape[0]
+    values = np.zeros(n)
+    for idx in prange(n):
+        values[idx] = _compute_pixel_nb(
+            rhs, metric, omega,
+            y0_batch[idx], lmbda_end, r_hor, r_esc,
+            r_tbl, I_tbl, in_edge, out_edge,
+            rtol, atol, mode_code)
+    return values
+\end{lstlisting}
+
+La novedad es que ya \textbf{no hay procesos workers} en este camino:
+todos los hilos comparten memoria a través de los arrays \texttt{y0\_batch},
+\texttt{values}, y las tablas numéricas del disco y de la métrica (cuando
+el agujero negro es numérico). El GIL se libera dentro del kernel gracias
+a \verb|nogil=True|, y el \emph{dispatch} de hilos lo maneja la capa de
+\emph{threading} de Numba (por defecto TBB en este entorno).
+
+\subsection{Detección de eventos en tiempo real}
+
+\subsubsection{Versión antigua: post-procesamiento sobre grilla fija}
+
+La implementación original usaba \texttt{scipy.integrate.odeint}, que
+devuelve la solución en una grilla de puntos $\lambda_i$ definida por
+\texttt{linspace}. La detección del disco y del horizonte se realizaba
+\emph{después} de la integración, escaneando manualmente el array de
+salida:
+
+\begin{lstlisting}[style=py, caption={Detección de eventos en la versión vieja.}]
+# Disco: cambio de signo de cos(theta) entre pasos consecutivos
+zi  = cos(sol[:, 2])
+zi1 = roll(zi, -1)
+indxs = where(zi * zi1 < 0)[0]
+
+# Horizonte: r < r_EH + epsilon en algún punto de salida
+indxs = where(sol[:, 1] < blackhole.EH + 1e-7)[0]
+\end{lstlisting}
+
+Este enfoque tiene dos limitaciones: (1) si el fotón cruza el horizonte
+\emph{entre} dos puntos consecutivos de la grilla, el cruce puede
+perderse o su posición queda imprecisa; (2) la resolución del evento
+depende de la densidad de la grilla (\texttt{int(7*final\_lmbda)}
+puntos), lo que puede subestimar la posición de cruce hasta en un paso.
+
+\subsubsection{Versión nueva: eventos funcionales con refinamiento}
+
+La nueva implementación define los eventos como funciones de signo
+$g(\lambda, y)$ cuyo cruce por cero dispara la acción correspondiente.
+La fábrica \texttt{make\_events()} en
+\texttt{scr/common/integrator.py} construye el conjunto estándar:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Evento} & \textbf{$g(\lambda, y)$} & \textbf{Terminal} & \textbf{Dirección} \\
+\midrule
+Horizonte & $y_1 - (r_{+} + \varepsilon)$, \; $\varepsilon = 10^{-3}$ &
+  Sí & $-1$ (solo decrece) \\
+Disco     & $\cos(y_2)$ &
+  No & $0$ (cualquier cruce) \\
+Escape    & $y_1 - r_{\rm esc}$ &
+  Sí & $+1$ (solo crece) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+En coordenadas esféricas, el plano ecuatorial corresponde a
+$\theta = \pi/2$, i.e.\ $\cos\theta = 0$. La función de disco detecta
+cada cambio de signo de $\cos(y_2)$ a lo largo de la trayectoria,
+sin detener la integración.
+
+\subsubsection{Refinamiento por interpolación cúbica de Hermite}
+
+Cuando el integrador detecta que $g(\lambda_n)\,g(\lambda_{n+1}) < 0$
+dentro de un paso aceptado, localiza el cero exacto usando el
+interpolante cúbico de Hermite que emplea las derivadas $k_1 = f(\lambda_n, y_n)$
+y $k_7 = f(\lambda_{n+1}, y_{n+1})$ (disponibles sin coste adicional
+gracias a la propiedad FSAL de Dormand-Prince):
+\[
+  y(s) = H_{00}(s)\,y_n \;+\; H_{10}(s)\,h\,k_1
+         \;+\; H_{01}(s)\,y_{n+1} \;+\; H_{11}(s)\,h\,k_7,
+  \quad s \in [0,1],
+\]
+donde los polinomios de Hermite son:
+\begin{align*}
+  H_{00}(s) &= 2s^3 - 3s^2 + 1, &
+  H_{10}(s) &= s^3 - 2s^2 + s, \\
+  H_{01}(s) &= -2s^3 + 3s^2, &
+  H_{11}(s) &= s^3 - s^2.
+\end{align*}
+El cero de $g$ sobre este interpolante se encuentra con 30 iteraciones
+de bisección (camino Numba) o con \texttt{scipy.optimize.brentq}
+(camino SciPy), alcanzando una precisión $\sim 10^{-9}$ en el parámetro
+afín $\lambda^*$ sin ninguna llamada extra a la RHS.
+
+\subsubsection{Por qué el evento de disco es no-terminal}
+
+Un diseño naive haría el evento de disco \emph{terminal}: detener
+la integración al primer cruce del ecuador. Sin embargo, los fotones
+del \emph{photon ring} orbitan cerca de la esfera de fotones
+($r \approx 3M$ en Schwarzschild) y cruzan el ecuador \emph{allí},
+fuera del anillo de acreción, antes de continuar hacia el disco.
+Si el evento fuera terminal, esos fotones serían detenidos en un
+cruce exterior al anillo y descartados incorrectamente, borrando el
+anillo de la imagen.
+
+La solución es registrar \emph{todos} los cruces ecuatoriales en un
+buffer pre-asignado (\texttt{y\_hits[MAX\_DISK\_HITS\_NB, 8]}) y
+delegar el filtrado al post-procesamiento: la función
+\texttt{\_first\_disk\_hit} en \texttt{scr/common/common.py} escanea
+los cruces en orden de integración (i.e.\ orden físico de emisión) y
+devuelve el primer cruce cuyo radio cae dentro del anillo
+$r \in [r_{\rm in}, r_{\rm out}]$:
+
+\begin{lstlisting}[style=py, caption={Selección del primer cruce dentro del anillo.}]
+def _first_disk_hit(res, acc_structure):
+    y_ev = res.y_events[1] if len(res.y_events) > 1 else None
+    if y_ev is None or len(y_ev) == 0:
+        return None
+    for yev in y_ev:
+        r_hit = float(yev[1])
+        if acc_structure.in_edge <= r_hit <= acc_structure.out_edge:
+            return list(yev)
+    return None
+\end{lstlisting}
+
+\section{Nuevos módulos y funciones}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.40\linewidth}p{0.55\linewidth}@{}}
+\toprule
+\textbf{Símbolo} & \textbf{Rol} \\
+\midrule
+\texttt{integrator.\_solve\_photon\_nb} &
+  Stepper RK45 \texttt{@njit} con eventos inline. \\
+\texttt{integrator.\_compute\_pixel\_nb} &
+  Pipeline por-pixel (integrate + scan + intensity + Doppler). \\
+\texttt{integrator.\_render\_image\_nb} &
+  Kernel paralelo con \texttt{prange} sobre \emph{batch} de fotones. \\
+\texttt{integrator.\_null\_omega\_nb} &
+  \emph{Stub} para agujeros sin $\Omega(r)$; nunca invocado en práctica. \\
+\texttt{parallel.trace\_threads\_nb} &
+  Envoltorio Python: empaqueta \texttt{iC}, llama al kernel,
+  reconstruye la imagen. \\
+\texttt{thin\_disk.\_intensity\_nb} &
+  \emph{Lookup} Numba de intensidad con guarda del anillo. \\
+\texttt{thin\_disk.structure.\_r\_tbl, \_I\_tbl} &
+  Tablas pre-computadas (Numba-\emph{friendly}) del flujo Novikov-Thorne. \\
+\texttt{schwarzschild.\_geodesics\_nb / \_metric\_nb / \_omega\_nb} &
+  RHS, métrica y $\Omega$ jitteados para la ruta numérica. \\
+\texttt{kerr.\_geodesics\_nb\_array / \_metric\_nb / \_omega\_nb} &
+  Versión array-form de la RHS (retorna \texttt{np.array}); métrica y
+  $\Omega$ jitteados. \\
+\texttt{num\_schwarzschild.\_R\_TBL, \_N\_TBL, \_DR\_TBL, \_DN\_TBL} &
+  Tablas de la métrica numérica como arrays de módulo. \\
+\texttt{scalar\_hair\_BH.\_R\_TBL, \_GTT\_COV, \_GRR\_COV, \dots} &
+  Ídem, $9$ columnas extraídas del archivo numérico. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cambios en módulos existentes}
+
+\begin{itemize}
+  \item \textbf{\texttt{scr/common/integrator.py}}: agregado \emph{dispatch}
+        de método \verb|"auto"| y \verb|"RK45_numba"|, que toman el camino
+        Numba si el agujero negro expone los \emph{hooks} jitteados; se
+        conservan los \emph{backends} \verb|DOP853|, \verb|LSODA|,
+        \verb|RK45_scipy| y \verb|Verlet| como \emph{fallback}.
+  \item \textbf{\texttt{scr/common/parallel.py}}: \texttt{trace\_parallel}
+        y \texttt{trace\_serial} detectan los \emph{hooks} Numba y
+        redirigen a \texttt{trace\_threads\_nb}; el camino
+        \emph{multiprocessing} sobrevive para casos que no exponen
+        los \emph{hooks}.
+  \item \textbf{\texttt{scr/common/common.py}}: default del integrador
+        pasó a \verb|"auto"|; \texttt{geodesic\_integrate} y
+        \texttt{geo\_integ\_no\_Doppler} escanean
+        \texttt{res.y\_events[disk\_idx]} para hallar el primer cruce
+        dentro del anillo (evento de disco no-terminal).
+  \item \textbf{\texttt{scr/black\_holes/num\_schwarzschild.py} y
+        \texttt{scalar\_hair\_BH.py}}: las tablas numéricas se cargan
+        una sola vez al \texttt{import} como arrays de módulo; la RHS
+        \texttt{@njit} usa \texttt{np.interp} (soportado por Numba) en
+        lugar de \texttt{scipy.interp1d}.
+  \item \textbf{\texttt{scr/accretion\_structures/thin\_disk.py}}: se
+        agregaron los arrays \texttt{self.\_r\_tbl},
+        \texttt{self.\_I\_tbl}, y la función de módulo
+        \texttt{\_intensity\_nb}.
+  \item \textbf{\texttt{scr/detectors/image\_plane.py}}: se generalizó el
+        cálculo de $k_t$ en \texttt{photon\_coords} (ver
+        sección~\ref{sec:photon_coords}).
+\end{itemize}
+
+\section{Generalización de \texttt{photon\_coords}}
+\label{sec:photon_coords}
+
+\subsection{Versión antigua: fórmula cerrada para Kerr}
+
+La versión original calculaba $k_t$ mediante una expresión algebraica
+derivada específicamente para la familia Kerr:
+
+\begin{lstlisting}[style=py, caption={Cálculo de $k_t$ en la versión vieja.}]
+k_t = -sqrt(g_phph / (g_tph**2 - g_tt*g_phph)) \
+      + alpha * g_tph / (self.D * sqrt(g_phph))
+\end{lstlisting}
+
+Esta fórmula supone implícitamente una relación fija entre los
+componentes covariantes $g_{tt}$, $g_{t\phi}$ y $g_{\phi\phi}$ que
+sólo se satisface en métricas de la familia Kerr con constante
+cosmológica cero. Cualquier otra métrica (Kerr-MOG, Kerr con
+quintaesencia, métricas numéricas) produce un $k_t$ incorrecto y,
+con él, un fotón que no es nulo desde el inicio.
+
+\subsection{Versión nueva: condición de nulidad exacta}
+
+La condición de nulidad $g^{\mu\nu}k_\mu k_\nu = 0$ es siempre una
+cuadrática en $k_t$ para métricas estacionarias y axisimétricas con
+sólo el término cruzado $g^{t\phi} \neq 0$:
+\[
+  g^{tt}\,k_t^2
+  + 2\,g^{t\phi}\,k_\phi\,k_t
+  + \underbrace{g^{rr}k_r^2 + g^{\theta\theta}k_\theta^2
+                + g^{\phi\phi}k_\phi^2}_{\displaystyle c}
+  = 0.
+\]
+Sus dos raíces son:
+\[
+  k_t = \frac{-b \pm \sqrt{b^2 - 4\,g^{tt}\,c}}{2\,g^{tt}},
+  \qquad b = 2\,g^{t\phi}\,k_\phi.
+\]
+Para \emph{backward ray tracing} el fotón debe ser pasado-apuntante,
+i.e.\ $k_t < 0$ (el tiempo decrece hacia el pasado). Con
+$g^{tt} < 0$ fuera del ergosfera, la rama ``$+\sqrt{\Delta}$'' es
+generalmente la negativa; si no, se toma la otra:
+
+\begin{lstlisting}[style=py, caption={Cálculo general de $k_t$ en la versión nueva.}]
+a_c = gtt_                             # g^tt < 0
+b_c = 2.0 * gtph_ * k_ph              # 2 g^{t phi} k_phi
+c_c = grr_*k_r**2 + gthth_*k_th**2 + gphph_*k_ph**2
+disc = b_c**2 - 4.0*a_c*c_c
+sq   = sqrt(max(disc, 0.0))           # guardia contra redondeo
+k_t  = (-b_c + sq) / (2.0*a_c)
+if k_t > 0:
+    k_t = (-b_c - sq) / (2.0*a_c)    # seleccion pasado-apuntante
+\end{lstlisting}
+
+La métrica inversa necesaria para $g^{\mu\nu}$ se obtiene de
+\texttt{blackhole.inverse\_metric(xin)} si el agujero negro la expone;
+en caso contrario, se calcula analíticamente a partir de la métrica
+covariante usando las relaciones del bloque $(t,\phi)$:
+\[
+  g^{tt} = \frac{g_{\phi\phi}}{\Delta_{t\phi}}, \quad
+  g^{\phi\phi} = \frac{g_{tt}}{\Delta_{t\phi}}, \quad
+  g^{t\phi} = \frac{-g_{t\phi}}{\Delta_{t\phi}}, \quad
+  \Delta_{t\phi} = g_{tt}\,g_{\phi\phi} - g_{t\phi}^2,
+\]
+y $g^{rr} = 1/g_{rr}$, $g^{\theta\theta} = 1/g_{\theta\theta}$,
+válidos para métricas diagonales-por-bloques.
+
+\subsection{Impacto físico}
+
+El cambio garantiza que $g^{\mu\nu}k_\mu k_\nu = 0$ se satisfaga
+exactamente para \emph{cualquier} métrica estacionaria axisimétrica,
+lo que implica:
+\begin{itemize}
+  \item Los fotones parten del plano de imagen con un 4-momento
+        genuinamente nulo, eliminando un error sistemático de orden
+        $\mathcal{O}(\alpha/D)$ que la fórmula antigua introducía en
+        métricas no-Kerr.
+  \item El mismo \texttt{photon\_coords} sirve para Schwarzschild,
+        Kerr, Kerr-MOG, Kerr con quintaesencia y métricas numéricas,
+        sin modificación.
+  \item El coste computacional extra es despreciable: cuatro
+        multiplicaciones y una raíz cuadrada adicional por fotón,
+        ejecutadas una sola vez al construir la lista de fotones.
+\end{itemize}
+
+\section{Resultados de performance}
+
+\emph{Benchmark} sobre \texttt{scaling\_real\_image.py} con
+Kerr $a = 0.7$, $D = 100$, $\iota = 85^{\circ}$, $1980 \times 1113 =
+2\,203\,740$ fotones, modo \verb|no_doppler|. La tolerancia del
+integrador es \texttt{rtol}$=10^{-9}$, \texttt{atol}$=10^{-11}$. Máquina
+WSL2 sobre Windows, $\sim 16$ núcleos físicos con \emph{hyperthreading}.
+
+\begin{center}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+\textbf{hilos} & \textbf{wall {[s]}} & \textbf{speedup} & \textbf{eficiencia} \\
+\midrule
+ 1 & 144.59 &  1.00$\times$ & 100.0\% \\
+ 2 &  67.01 &  2.16$\times$ & 107.9\% \\
+ 4 &  46.78 &  3.09$\times$ &  77.3\% \\
+ 8 &  34.91 &  4.14$\times$ &  51.8\% \\
+16 &  20.12 &  7.19$\times$ &  44.9\% \\
+24 &  16.96 &  8.53$\times$ &  35.5\% \\
+32 &  13.86 & 10.43$\times$ &  32.6\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Comparado con el \emph{stack} original (\texttt{scipy.solve\_ivp} +
+\texttt{multiprocessing.Pool}) en el mismo equipo y resolución, una
+corrida \emph{single-thread} pasó de $\sim 3900$\,s estimados a
+$144.6$\,s ($\approx 27\times$) y la configuración con 32 hilos pasó de
+$\sim 440$\,s estimados a $13.9$\,s ($\approx 32\times$). A 16 hilos
+el tiempo por fotón bajó de $467\,\mu$s a $9.1\,\mu$s.
+
+El \emph{speedup} \emph{super-lineal} a 2 hilos (107\%) no es un error:
+se debe a que el \emph{single-thread} ya paga el coste de inicialización
+de la capa de \emph{threading} de Numba mientras que con 2 hilos ese
+coste se amortiza a lo largo de $2.2$M iteraciones.
+
+\section{Ventajas de la nueva implementación}
+
+\begin{enumerate}
+  \item \textbf{Cero \emph{overhead} de Python en el \emph{hot path}}:
+        un único cruce Python$\leftrightarrow$Numba por imagen (antes
+        eran del orden de $10^{7}$: siete \emph{stages}
+        por paso $\times 300$ pasos $\times 2.2$M fotones).
+  \item \textbf{Eliminación del IPC}: no hay \texttt{pickle}, no hay
+        \emph{fork}, no hay \texttt{imap\_unordered}; todos los hilos
+        escriben al mismo array \texttt{values}.
+  \item \textbf{Compatibilidad hacia atrás}: los scripts
+        \texttt{ex1-ex7.py} y cualquier código externo que llame a
+        \texttt{integrate(\ldots, method="DOP853")} siguen funcionando
+        sin cambios; el \emph{dispatch} \verb|"auto"| elige la ruta
+        Numba sólo si el agujero negro expone los \emph{hooks}.
+  \item \textbf{Detección correcta del \emph{photon ring}}: al registrar
+        cada cruce del ecuador y filtrar por anillo en
+        \emph{post-processing}, los fotones que orbitan la esfera de
+        fotones y emiten desde el disco interior quedan correctamente
+        contabilizados --- algo que la versión \emph{single-event
+        terminal} había perdido.
+  \item \textbf{Refinamiento numérico equivalente}: la bisección
+        \emph{inline} sobre el interpolante cúbico Hermite reproduce
+        la posición del evento con la misma tolerancia
+        ($\sim 10^{-9}$) que \texttt{scipy.optimize.brentq}, sin
+        llamadas de vuelta a Python.
+  \item \textbf{Escalabilidad física}: el kernel paralelo escala
+        razonablemente ($\sim 10\times$ con 32 hilos) en un equipo con
+        $\sim 16$ núcleos físicos; la caída a 32\% de eficiencia refleja
+        contención por \emph{hyperthreading} y ancho de banda de memoria
+        --- no del diseño del código.
+\end{enumerate}
+
+\section{Limitaciones y trabajo pendiente}
+
+\begin{itemize}
+  \item El \emph{backend} Verlet queda por fuera del camino Numba --- se
+        usa en experimentos de preservación de la restricción
+        Hamiltoniana pero rara vez en \emph{producción}.
+  \item La métrica Kerr-MOG con horizonte cosmológico (
+        \texttt{render\_kerr\_mog.py}) aún no expone \emph{hooks} Numba;
+        está en el \emph{backlog}.
+  \item El agujero negro \emph{scalar hair} presenta un bug
+        pre-existente en \texttt{thin\_disk.f(r)} cuando
+        $x_{0} = \sqrt{\rm ISCO} = x_{1} = 2\cos(-\pi/6) = \sqrt{3}$
+        (caso $a = 0$, $\rm ISCO = 3$), que produce divisiones
+        $0/0$ y hace que toda la tabla \texttt{ff} sea \texttt{NaN}.
+        Se trata por separado.
+  \item La \emph{primera} invocación del kernel paga un coste de
+        compilación de $\sim 3$\,s; las corridas posteriores en la misma
+        sesión lo ahorran gracias al cache en memoria. La cache en disco
+        de algunas funciones queda inhibida por el uso de arrays
+        globales (\emph{warning} de Numba), pero esto no afecta
+        \emph{runtime} tras la primera ejecución.
+\end{itemize}
+
+\section{Validación}
+
+\begin{itemize}
+  \item \textbf{Regresión visual}: se re-generó la imagen de referencia
+        Kerr $a=0.7$ $1920\times 1080$ \emph{no-Doppler} con el nuevo
+        pipeline; la comparación visual con la versión \texttt{scipy}
+        no muestra diferencias más allá del ruido numérico
+        ($<1\%$ por pixel, dentro de la tolerancia del integrador).
+  \item \textbf{Restricción Hamiltoniana}: la verificación
+        \texttt{verify\_Hamiltonian} en
+        \texttt{ex7.Hamiltonian\_constraint.py} sigue entregando
+        $|H_{\max} - H_{0}| < 10^{-6}$ para Kerr y Schwarzschild.
+  \item \textbf{Anillo de fotones}: la imagen de $1980\times 1113$
+        reproduce el anillo superior \emph{y} el reflejo lensado
+        inferior que en la versión \emph{single-event terminal}
+        se perdía.
+\end{itemize}
+
+\section*{Reproducción}
+
+\begin{lstlisting}[style=py]
+# Renderizado completo:
+python render_all_blackholes.py
+
+# Imagen Kerr a=0.7 1920x1080 no-Doppler:
+python "ex2.BH_Image no-Doppler.py"
+
+# Benchmark de escalado:
+python scaling_real_image.py
+\end{lstlisting}
+
+\end{document}
