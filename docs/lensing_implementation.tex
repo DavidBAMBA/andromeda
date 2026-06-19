@@ -1,0 +1,581 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=2.4cm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc, fit, backgrounds}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=blue!60!black
+}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{codekw}{rgb}{0.10,0.10,0.60}
+\definecolor{codestr}{rgb}{0.40,0.20,0.00}
+\definecolor{codecom}{rgb}{0.30,0.50,0.30}
+
+\lstdefinestyle{py}{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{codekw}\bfseries,
+    stringstyle=\color{codestr},
+    commentstyle=\color{codecom}\itshape,
+    language=Python,
+    breaklines=true,
+    numbers=none,
+    tabsize=4,
+    showstringspaces=false,
+    frame=single,
+    framesep=4pt,
+    xleftmargin=6pt,
+    xrightmargin=6pt
+}
+
+\title{Extensión de Andromeda a \emph{gravitational lensing}\\
+\large Métricas de lente, plano fuente y composición observacional}
+\author{David Bamba\\\small Universidad Nacional de Colombia}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este documento registra la extensión del motor de \emph{ray tracing} de
+Andromeda al régimen de \emph{gravitational lensing}. A partir del núcleo
+numérico ya existente para agujeros negros (integrador Numba, paralelización
+con \texttt{prange}, eventos, detector) se añaden (i) métricas de lente en
+régimen de campo débil (SIS y SIE), (ii) una clase \texttt{SourcePlane} con
+perfiles de luz 2D compilados (Gaussiano y Sérsic), (iii) un nuevo modo
+\texttt{lensing} en el \emph{dispatcher} de trazado que intersecta los rayos
+escapados con el plano fuente y (iv) una capa de composición visual
+(galaxias de fondo, \emph{starfield}, ruido fotográfico, \emph{stretch}
+\texttt{asinh}) para producir imágenes comparables a observaciones HST.
+Se documentan las hipótesis físicas, el contrato de interfaz entre módulos,
+los ejemplos implementados y las limitaciones conocidas.
+\end{abstract}
+
+\tableofcontents
+
+\bigskip
+
+
+\section{Motivación y alcance}
+
+El núcleo de Andromeda fue diseñado para trazar geodésicas nulas en fondos
+de Kerr y Schwarzschild (incluyendo variantes MOG y \emph{scalar-hair}) y
+producir imágenes del disco de acreción. Toda la maquinaria numérica
+---integrador adaptativo con detección de eventos, paralelización, detector
+en el plano imagen--- es \textbf{agnóstica a la métrica}: cualquier
+espaciotiempo que exponga los \emph{hooks} Numba
+(\texttt{\_rhs\_nb}, \texttt{\_metric\_nb}, \texttt{\_omega\_nb}) puede
+ser trazado sin tocar el \emph{hot path}.
+
+La extensión a \emph{gravitational lensing} aprovecha esa neutralidad:
+se añaden métricas de lente siguiendo el mismo contrato y se introduce un
+nuevo tipo de objeto (\texttt{SourcePlane}) que reemplaza al disco de
+acreción como destino de los rayos. Todo el código numérico existente
+(integrador, eventos, paralelización) se reutiliza sin modificación.
+
+\paragraph{Lo que NO se documenta aquí.}
+Los detalles del integrador Numba, el \emph{dispatcher} de eventos, la
+paralelización con \texttt{prange} y el contrato de los \emph{hooks}
+métricos ya están cubiertos en \texttt{numba\_refactor.tex}. Aquí solo
+se describe lo \emph{añadido} para lensing.
+
+
+\section{Métricas de lente en campo débil}
+
+\subsection{Forma general del \emph{line element}}
+
+Las métricas implementadas parten de la forma isotrópica en campo débil
+\begin{equation}
+  ds^2 = -A(r,\theta)^2\, dt^2 + B(r,\theta)^2\,
+         \bigl(dr^2 + r^2\,d\theta^2 + r^2\sin^2\theta\, d\phi^2\bigr),
+  \label{eq:weak_field}
+\end{equation}
+con $A = 1 + \Phi$, $B = 1 - \Phi$ y $\Phi \ll 1$. Esto no es una solución
+exacta de las ecuaciones de Einstein; es la forma canónica del lensing
+gravitacional a primer orden en $\Phi$, que reproduce correctamente la
+deflexión de la luz $\alpha = 2\Delta\Phi$ pero descarta términos
+no-lineales en $\Phi$.
+
+La unidad geometrizada es $G = c = 1$. No se introduce aún cosmología
+FRW: las distancias $D_L$, $D_{LS}$ se fijan a mano en unidades de $M$.
+
+\subsection{Singular Isothermal Sphere (SIS)}
+
+Archivo: \texttt{scr/lens\_metrics/sis.py}.
+
+Potencial esféricamente simétrico:
+\begin{equation}
+  \Phi(r) = 2\sigma_v^2 \ln\!\left(\frac{r}{r_{\rm ref}}\right),
+\end{equation}
+que reproduce el campo de una esfera isoterma singular con dispersión de
+velocidades $\sigma_v$ (en unidades de $c$). La deflexión resultante es
+constante en $b$ (parámetro de impacto):
+\begin{equation}
+  \alpha_{\rm SIS} = 4\pi\sigma_v^2,
+\end{equation}
+y produce un radio de Einstein $b_E = 4\pi\sigma_v^2\, D_{LS}$.
+
+\subsection{Singular Isothermal Ellipsoid (SIE)}
+
+Archivo: \texttt{scr/lens\_metrics/sie.py}.
+
+Generalización ellipsoidal del SIS:
+\begin{equation}
+  \Phi(r,\theta) = 2\sigma_v^2 \ln\!\left(\frac{\xi}{r_{\rm ref}}\right),
+  \qquad
+  \xi = r\sqrt{\sin^2\theta + \frac{\cos^2\theta}{q_{\rm ax}^2}}.
+\end{equation}
+
+El parámetro $q_{\rm ax}\in(0,1]$ es el cociente de semiejes:
+$q_{\rm ax} = 1$ recupera el SIS, $q_{\rm ax} < 1$ corresponde a un
+elipsoide oblato respecto al eje $z$.
+
+Las derivadas parciales (usadas por el \emph{hook} geodésico) son
+\begin{align}
+  \partial_r \Phi &= \frac{2\sigma_v^2}{r},\\[2pt]
+  \partial_\theta \Phi &= 2\sigma_v^2\,
+      \frac{\sin\theta\cos\theta\,(1 - 1/q_{\rm ax}^2)}
+           {\sin^2\theta + \cos^2\theta/q_{\rm ax}^2}.
+\end{align}
+
+Se preserva la axisimetría en $\phi$ (el momento angular $k_\phi$ se
+conserva), por lo que un rayo que parte en el plano ecuatorial permanece
+allí.
+
+\subsection{Contrato de interfaz}
+
+Cada \texttt{LensMetric} expone exactamente los mismos atributos que
+\texttt{BlackHole} (ver \texttt{numba\_refactor.tex}):
+\begin{itemize}
+  \item \texttt{\_rhs\_nb(q)} \ \ --- RHS geodésico compilado,
+  \item \texttt{\_metric\_nb(x)} --- componentes de $g_{\mu\nu}$,
+  \item \texttt{\_omega\_nb(\ldots)} --- velocidad angular nula
+        (\emph{dummy} en lensing, requerido por el \emph{dispatcher}),
+  \item \texttt{EH} --- pseudo-horizonte numérico
+        (\texttt{r\_min}$\sim 10^{-2}$ actúa como corte del potencial
+        logarítmico divergente).
+\end{itemize}
+
+Esto garantiza que \texttt{parallel.trace\_*} y el integrador no distinguen
+entre un rayo en Kerr y un rayo en SIE: el mismo \texttt{solve\_ivp}
+interno.
+
+
+\section{Plano fuente y perfiles de luz}
+
+\subsection{Clase \texttt{SourcePlane}}
+
+Archivo: \texttt{scr/common/lens\_image.py}.
+
+\begin{lstlisting}[style=py]
+class SourcePlane:
+    def __init__(self, D_LS, profile):
+        self.D_LS    = float(D_LS)   # distancia lente-fuente
+        self.profile = profile       # light profile 2D
+        # duck-type para el dispatcher (no se usan en modo lensing)
+        self._r_tbl = np.zeros(2, dtype=np.float64)
+        self._I_tbl = np.zeros(2, dtype=np.float64)
+        self.in_edge  = 0.0
+        self.out_edge = 0.0
+\end{lstlisting}
+
+El plano se sitúa perpendicular al eje óptico en $x = -D_{LS}$. El
+\emph{duck-type} con atributos heredados de \texttt{thin\_disk.structure}
+permite que el \emph{dispatcher} de \texttt{parallel.py} acepte un
+\texttt{SourcePlane} donde esperaba una estructura de disco, sin
+ramificación adicional.
+
+\subsection{Perfiles 2D compilados}
+
+Archivo: \texttt{scr/sources/light\_profiles.py}.
+
+Cada perfil empaca sus parámetros en un \texttt{float64[8]} y expone una
+etiqueta entera \texttt{\_kind}. Un único dispatcher Numba evalúa el
+brillo en $(x,y)$:
+
+\begin{lstlisting}[style=py]
+@njit(cache=True)
+def _eval_profile_nb(xs, ys, kind, params):
+    if kind == 0:   # Gaussian
+        ...
+    elif kind == 1: # Sersic
+        ...
+    return 0.0
+\end{lstlisting}
+
+\paragraph{Gaussiano.}
+\begin{equation}
+  I(x,y) = I_0\,\exp\!\left[-\frac{(x-x_0)^2 + (y-y_0)^2}{2\sigma^2}\right].
+\end{equation}
+
+\paragraph{Sérsic elíptico.}
+\begin{equation}
+  I(x,y) = I_e\,\exp\!\left[-b_n\!\left(\left(\frac{R}{R_e}\right)^{1/n}
+  - 1\right)\right],
+  \qquad
+  R = \sqrt{x_r^2 + (y_r/q)^2},
+\end{equation}
+con $(x_r,y_r)$ rotado por el ángulo de posición \texttt{pa} alrededor
+de $(x_0,y_0)$, $q = 1 - \varepsilon$ (axial ratio),
+y $b_n$ aproximado por la expansión de Ciotti \& Bertin (1999)
+\begin{equation}
+  b_n \simeq 2n - \frac{1}{3} + \frac{4}{405\,n}
+            + \frac{46}{25515\,n^2}.
+\end{equation}
+
+$n = 1$ corresponde a un disco exponencial; $n = 4$ a un perfil de
+Vaucouleurs típico de elípticas.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{figs/profiles.pdf}
+  \caption{Perfiles de luz 2D compilados
+  (\texttt{scr/sources/light\_profiles.py}). Cada panel muestra el
+  mapa de brillo $I(x,y)$ con \emph{stretch} asinh y, debajo, un corte
+  unidimensional a $y = 0$ en escala log-$y$. La Gaussiana es la
+  referencia circular; el Sérsic $n = 1$ reproduce un disco
+  exponencial; el Sérsic $n = 4$ (de Vaucouleurs) concentra brillo
+  hacia el centro con alas extendidas; la variante con
+  $\varepsilon = 0{,}45$ es la fuente usada en \texttt{ex15} para
+  producir arcos asimétricos. Generado por
+  \texttt{docs/figs/gen\_profiles.py}.}
+  \label{fig:profiles}
+\end{figure}
+
+\paragraph{Añadir un perfil nuevo.} Basta con (i) definir una nueva
+etiqueta \texttt{KIND\_X}, (ii) añadir una rama en \texttt{\_eval\_profile\_nb}
+y (iii) crear una clase con \texttt{\_kind} y \texttt{\_params} como
+atributos. Ningún otro módulo necesita cambio.
+
+
+\section{Modo \texttt{lensing} del \emph{dispatcher}}
+
+El módulo \texttt{scr/common/parallel.py} acepta cuatro modos:
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+  \toprule
+  \textbf{Código} & \textbf{Modo} \\
+  \midrule
+  0 & \texttt{no\_doppler} \\
+  1 & \texttt{doppler} \\
+  2 & \texttt{shadow} \\
+  \textbf{3} & \textbf{\texttt{lensing}} (nuevo) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+En modo \texttt{lensing}:
+
+\begin{enumerate}
+  \item El integrador traza el rayo \emph{backwards} desde el pixel del
+        detector hasta que se dispara el evento \texttt{escape}
+        ($r > r_{\rm escape}$).
+  \item A partir del estado final
+        $(x_{\rm esc}, k^\mu_{\rm esc})$ se extrapola en línea recta
+        hasta el plano fuente: el rayo sale del campo gravitatorio y
+        viaja en vacío. Se resuelve
+        \begin{equation}
+          x(\lambda) = -D_{LS},
+        \end{equation}
+        para $\lambda$ y se obtiene $(y_{\rm src}, z_{\rm src})$.
+  \item Se evalúa el brillo
+        $I = \text{\texttt{\_eval\_profile\_nb}}(y_{\rm src}, z_{\rm src},
+        \text{\texttt{kind}}, \text{\texttt{params}})$
+        y se asigna al pixel.
+\end{enumerate}
+
+\texttt{LensImage} (subclase de \texttt{Image}) es azúcar sintáctico para
+fijar \texttt{mode="lensing"} al llamar \texttt{create\_image()}.
+
+\begin{lstlisting}[style=py]
+class LensImage(Image):
+    def create_image(self, n_workers=None, chunksize=None):
+        self._trace(mode="lensing",
+                    n_workers=n_workers,
+                    chunksize=chunksize)
+\end{lstlisting}
+
+\subsection{Geometría del detector}
+
+El detector ya existente (\texttt{scr/detectors/image\_plane.py}) se usa
+sin modificación. Para lensing conviene fijar $\iota = \pi/2$
+(proyección paralela, observador en el infinito), de forma que cada pixel
+sea un rayo con el mismo vector $\hat{k}$ pero diferente parámetro de
+impacto $b = \sqrt{\alpha^2 + \beta^2}$.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{figs/geometry.pdf}
+  \caption{Geometría del pipeline de lensing. El plano fuente (izquierda,
+  $x = -D_{LS}$) contiene la distribución de brillo $I(y,z)$; la lente
+  (centro, naranja) curva las geodésicas nulas; el detector (derecha,
+  $x = +D_L$) registra un pixel $(\alpha,\beta)$ por cada rayo trazado
+  \emph{hacia atrás}. Las trayectorias azules y rojas corresponden a
+  geodésicas nulas reales (SIS, $\sigma_v = 0{,}03\,c$); las líneas
+  grises discontinuas son el contrafactual sin lensing; las
+  dos imágenes a $\pm b_E$ forman el anillo de Einstein. Generado por
+  \texttt{docs/figs/gen\_geometry.py}.}
+  \label{fig:geometry}
+\end{figure}
+
+
+\section{Composición de imagen observacional}
+
+El contenido anterior basta para producir un \emph{arco bruto} del rayo
+lensado. Para obtener imágenes con aspecto de observación real se añadió
+una capa de post-proceso en \texttt{scr/common/visual.py}:
+
+\begin{description}
+  \item[\texttt{project\_profile\_on\_detector}] evalúa directamente un
+        perfil 2D en el plano imagen, sin \emph{ray tracing}. Se usa para
+        la luz propia de la galaxia-lente (que no se lensa a sí misma) y
+        para galaxias de fondo proyectadas.
+  \item[\texttt{add\_starfield}] genera $N$ estrellas puntuales con PSF
+        Gaussiana, flujos log-uniformes y posiciones aleatorias.
+  \item[\texttt{add\_photographic\_noise}] aplica ruido Poisson
+        (escalado por \texttt{poisson\_scale}) más ruido Gaussiano de
+        lectura. No modela \emph{cosmic rays} ni \emph{dark current}.
+  \item[\texttt{compose\_rgb}] combina capas monocromáticas en RGB
+        aplicando colores prefijados por componente.
+  \item[\texttt{asinh\_stretch}] \emph{stretch} percepción-lineal al
+        estilo HST:
+        \begin{equation}
+          I_{\rm out} = \frac{\mathrm{asinh}(I/s)}{\mathrm{asinh}(I_{\max}/s)},
+        \end{equation}
+        con \emph{softening} $s$ y máximo tomado del percentil 99.7 de
+        la luminancia.
+\end{description}
+
+
+\section{Pipeline completo}
+
+\begin{tikzpicture}[
+  node distance=6.5mm,
+  every node/.style={rectangle, rounded corners=2pt, draw=black!65,
+                     inner sep=4pt, font=\footnotesize, align=center,
+                     minimum width=3.6cm},
+  arr/.style={-{Stealth[length=1.6mm]}, thick, black!70}
+]
+  \node (metric) [fill=blue!6]  {\texttt{LensMetric} (SIS / SIE)\\
+                                  \scriptsize hooks Numba};
+  \node (det)    [below=of metric, fill=blue!6]
+                                 {\texttt{detector}\\\scriptsize $\iota, D_L$, pixeles};
+  \node (phot)   [below=of det, fill=blue!6]
+                                 {\texttt{create\_photons()}\\\scriptsize $k^\mu_0$ por pixel};
+  \node (trace)  [below=of phot, fill=orange!12]
+                                 {\texttt{parallel.trace\_*}\\\scriptsize mode=\texttt{lensing}};
+  \node (src)    [below=of trace, fill=green!8]
+                                 {\texttt{SourcePlane} + \texttt{light\_profiles}\\
+                                  \scriptsize Sérsic / Gaussian};
+  \node (vis)    [below=of src, fill=red!8]
+                                 {\texttt{visual.*}\\
+                                  \scriptsize starfield, noise, asinh};
+  \node (out)    [below=of vis]  {PNG + NPY};
+
+  \draw[arr] (metric) -- (det);
+  \draw[arr] (det)    -- (phot);
+  \draw[arr] (phot)   -- (trace);
+  \draw[arr] (trace)  -- (src);
+  \draw[arr] (src)    -- (vis);
+  \draw[arr] (vis)    -- (out);
+\end{tikzpicture}
+
+
+\section{Ejemplos implementados}
+
+Todos los ejemplos viven en la raíz del repositorio y guardan sus salidas
+en \texttt{images/lensing/} y \texttt{images\_data/lensing/}.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}p{3.4cm}p{12.5cm}@{}}
+  \toprule
+  \textbf{Ejemplo} & \textbf{Qué valida / muestra} \\
+  \midrule
+  \texttt{ex9.einstein\_ring} &
+  Schwarzschild puntual + fuente Gaussiana en el eje $\Rightarrow$ anillo
+  de Einstein. Se verifica
+  $b_{\rm ring} = 2\sqrt{M\,D_{LS}}$. \\
+  \texttt{ex10.cosmic\_horseshoe} &
+  SIS + Sérsic desplazado + composición RGB con \emph{starfield} suave.
+  Produce un arco tipo ``Cosmic Horseshoe'' (LRG 3-757). \\
+  \texttt{ex11.lensing\_trajectory} &
+  Trazado directo de geodésicas nulas en SIS; diagrama con ángulos de
+  deflexión y parámetros de impacto. \\
+  \texttt{ex12.kerr\_lensing} &
+  Kerr ($a = 0.9$) vs Schwarzschild lado a lado; visualiza la asimetría
+  por \emph{frame-dragging} en régimen de campo fuerte. \\
+  \texttt{ex13.einstein\_cross} &
+  SIS vs SIE ($q = 0.55$): anillo simétrico contra configuración de
+  imágenes múltiples (cruz de Einstein). \\
+  \texttt{ex14.realistic\_lensing} &
+  Primera capa de realismo observacional: múltiples fuentes lensadas,
+  galaxias de fondo no-lensadas, \emph{starfield}, ruido fotográfico. \\
+  \texttt{ex15.broken\_ring\_lensing} &
+  SIE + fuente primaria fuertemente elíptica ($\varepsilon = 0{,}45$);
+  arcos asimétricos con ``puentes'' entre imágenes múltiples. \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+
+\section{Hipótesis físicas y validez}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{figs/trajectory_comparison.pdf}
+  \caption{Mismo integrador, dos regímenes. Izquierda: Schwarzschild
+  ($M = 1$), régimen de campo fuerte; los rayos con parámetro de impacto
+  cerca de $b_{\rm crit} = 3\sqrt{3}\,M$ rodean la esfera de fotones y
+  algunos terminan cayendo al horizonte. Derecha: lente SIS
+  galáctico ($\sigma_v = 0{,}03\,c$); los rayos se deflectan suavemente
+  en un régimen de campo débil $|\Phi| \ll 1$ y todos escapan. Ambos
+  casos usan el mismo integrador (RK45/DOP853) y el mismo sistema de
+  eventos, cambiando únicamente el objeto métrica. Generado por
+  \texttt{docs/figs/gen\_trajectory\_comparison.py}.}
+  \label{fig:trajcomp}
+\end{figure}
+
+\begin{itemize}
+  \item \textbf{Campo débil.} La métrica (\ref{eq:weak_field}) es
+        estrictamente válida para $|\Phi| \ll 1$. En los ejemplos se usa
+        $\sigma_v \sim 0{,}028\,c$ (velocidades infladas respecto a
+        galaxias reales, $\sim 200$\,km/s $\approx 10^{-3}\,c$) solo
+        para obtener radios de Einstein visualmente representativos en
+        unidades geometrizadas. La deflexión angular reproducida sigue
+        siendo correcta a primer orden, pero el régimen no es
+        estrictamente ``weak'' cuando se fuerzan estos valores.
+  \item \textbf{Axisimetría.} Todas las métricas de lente conservan
+        $k_\phi$. Lentes no-axisimétricas generales (p.ej.\ con
+        \emph{external shear} en dirección arbitraria) requieren romper
+        esta simetría y no están implementadas.
+  \item \textbf{Un único plano fuente.} No hay \emph{multi-plane
+        lensing}: la intersección se hace con un solo
+        \texttt{SourcePlane} a distancia $D_{LS}$ fija.
+  \item \textbf{Plano fuente plano.} La fuente no se extiende en
+        \emph{redshift}: todo el perfil vive en $x = -D_{LS}$ exactamente.
+  \item \textbf{Cosmología ausente.} No se han introducido distancias
+        angulares de diámetro FRW; $D_L$ y $D_{LS}$ son parámetros libres
+        en unidades de $M$. Esto impide convertir a arcsec o kpc.
+  \item \textbf{Galaxias de fondo no lensadas.} En los composites
+        (\texttt{ex10}, \texttt{ex14}, \texttt{ex15}) las galaxias de
+        fondo se proyectan directamente; en la realidad también sufren
+        convergencia y \emph{shear}, aunque en régimen débil.
+  \item \textbf{Óptica del detector.} No hay PSF de Hubble ni patrón de
+        difracción. La resolución está limitada solo por el muestreo
+        angular del plano imagen.
+  \item \textbf{Ruido.} Modelo simple Poisson + Gaussiano. No se
+        modelan \emph{dark current}, \emph{cosmic rays}, \emph{flat-field
+        residuals} ni \emph{charge transfer inefficiency}.
+  \item \textbf{Colores.} Arbitrarios, no derivados de SED por
+        \emph{redshift} por filtro; son una convención visual.
+\end{itemize}
+
+
+\section{Qué está validado y qué falta validar}
+
+\paragraph{Validado numéricamente.}
+\begin{itemize}
+  \item Radio de Einstein de Schwarzschild
+        $b_E = 2\sqrt{M\,D_{LS}}$ (\texttt{ex9}).
+  \item Deflexión constante en SIS
+        $\alpha = 4\pi\sigma_v^2$ (verificación en \texttt{ex11}).
+  \item Hamilton-constraint en cada paso del integrador
+        (\texttt{Image.verify\_Hamiltonian()}, heredado del trazado BH).
+\end{itemize}
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\linewidth]{figs/deflection.pdf}
+  \caption{Validación cuantitativa de la deflexión angular. Izquierda:
+  en Schwarzschild la deflexión $\alpha(b)$ medida por el ray-tracer
+  (puntos rojos) sigue la predicción analítica a primer orden
+  $\alpha = 4M/b$ (línea negra); se evitan parámetros de impacto cerca
+  de $b_{\rm crit} = 3\sqrt{3}\,M$ donde los términos no-lineales
+  dominan. Derecha: en SIS la deflexión es independiente del parámetro
+  de impacto ($\alpha = 4\pi\sigma_v^2$, línea negra) y los puntos
+  numéricos (azules) reproducen el plateau. El error relativo mediano
+  se muestra en cada panel. Generado por
+  \texttt{docs/figs/gen\_deflection.py}.}
+  \label{fig:deflection}
+\end{figure}
+
+\paragraph{Pendiente de validación (propuesta).}
+\begin{itemize}
+  \item \textbf{Test de topología de imágenes múltiples}
+        (\emph{caustic validation}): con SIE fijo, variar solo el
+        \emph{offset} de la fuente para reproducir las transiciones
+        $4 \to 3 \to 2$ imágenes al cruzar las cáusticas tangencial y
+        radial. Si el kernel numérico reproduce las cuatro topologías
+        con un único parámetro, el trazado en lensing está validado más
+        allá de la simple posición del anillo.
+  \item \textbf{Magnificación}: recuperar $\mu = 1/\det(A)$ por
+        diferenciación numérica del mapa $\beta(\theta)$ y comparar con
+        fórmulas analíticas para SIS/SIE (no implementado aún).
+\end{itemize}
+
+
+\section{Resumen de archivos añadidos / modificados}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}p{5.4cm}p{10.5cm}@{}}
+  \toprule
+  \textbf{Archivo} & \textbf{Rol} \\
+  \midrule
+  \texttt{scr/lens\_metrics/sis.py} & Métrica SIS (nuevo). \\
+  \texttt{scr/lens\_metrics/sie.py} & Métrica SIE (nuevo). \\
+  \texttt{scr/sources/light\_profiles.py} &
+    Gaussian + Sérsic + dispatcher Numba (nuevo). \\
+  \texttt{scr/common/lens\_image.py} &
+    \texttt{SourcePlane} y \texttt{LensImage} (nuevo). \\
+  \texttt{scr/common/visual.py} &
+    \emph{starfield}, ruido, RGB, \emph{asinh stretch} (nuevo). \\
+  \texttt{scr/common/parallel.py} &
+    Añadido modo \texttt{lensing} al \emph{dispatcher} (modificado). \\
+  \texttt{ex9 -- ex15} &
+    Ejemplos de validación y composición observacional (nuevo). \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Ninguno de los archivos del núcleo numérico BH
+(\texttt{integrator.py}, \texttt{\_solvers.py}, \texttt{\_numba\_kernels.py})
+fue modificado: toda la extensión es aditiva.
+
+
+\section{Siguientes pasos}
+
+La hoja de ruta para aproximar aún más las imágenes a observaciones
+reales está descrita en \texttt{LENSING.md} y se resume en:
+\begin{enumerate}
+  \item Introducir cosmología FRW ($D_L$, $D_S$, $D_{LS}$ por
+        \emph{redshift}; conversión a arcsec / kpc).
+  \item Añadir métricas adicionales: NFW, PEMD/EPL, \emph{external
+        convergence} y \emph{shear}.
+  \item Calcular curvas críticas, cáusticas, mapas de magnificación y
+        \emph{time-delay}.
+  \item Convolución con PSF real (HST F814W/F160W) y modelo de ruido
+        observacional completo.
+  \item Fuentes extendidas no paramétricas (imágenes reales como perfil
+        de fuente).
+\end{enumerate}
+
+
+\end{document}
