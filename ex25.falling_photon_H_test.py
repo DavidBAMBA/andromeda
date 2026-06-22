@@ -3,13 +3,16 @@
 ex25 - Hamiltonian-constraint drift for THIS project's integrators (falling)
 ===============================================================================
 Schwarzschild analogue of the OSIRIS Fig. 5 test (a null geodesic that FALLS
-into the horizon), comparing the integrators that ACTUALLY exist here:
+into the horizon), comparing the FIVE integrators that TARTARUS implements as
+Numba shadow kernels (scr/common/_shadow_numba) and that run, identically, on
+the in-house numpy backend (scr/common/integrator):
 
-    LSODA / DOP853 / RK45 (in-house DP) / Verlet
+    RKDP45 / RKCK45 / RKF45 / Bulirsch-Stoer / Verlet
 
-(not the paper's RKCK45 / RKF45 / Bulirsch-Stoer). Impact parameter is
-sub-critical (b < b_crit = 3*sqrt(3)) so the photon is captured; integration
-stops just outside the horizon (R_STOP) to avoid the coordinate singularity.
+This is the exact same set OSIRIS compares in its Fig. 5 (RKDP45/RKCK45/RKF45/BS)
+plus Verlet.  Impact parameter is sub-critical (b < b_crit = 3*sqrt(3)) so the
+photon is captured; integration stops just outside the horizon (R_STOP) to avoid
+the coordinate singularity.
 
 Run from the repository root:
     python "ex25.falling_photon_H_test.py"
@@ -18,9 +21,10 @@ Run from the repository root:
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import LogLocator, NullFormatter
 
 from scr.black_holes import schwarzschild
-from scr.common import photon_methods as pm
+from scr.common import integrator
 from scr.common.common import Hamiltonian
 
 import warnings
@@ -34,6 +38,15 @@ R0 = 100.0
 B = 3.0
 R_STOP = 2.05
 SAVENAME = "falling_photon_H_test_schwarzschild"
+
+# The five in-house integrators (1:1 twins of the Numba shadow kernels).
+METHODS = ["DP45", "CK45", "RKF45", "BS", "Verlet"]
+NICE = {"DP45": "RKDP45", "CK45": "RKCK45", "RKF45": "RKF45",
+        "BS": "Bulirsch-Stoer", "Verlet": "Verlet"}
+COLOR = {"DP45": "#5E96C8", "CK45": "#E0956B", "RKF45": "#A07BC8",
+         "BS": "#C77B92", "Verlet": "#6CB48A"}
+LS = {"DP45": "-", "CK45": "--", "RKF45": "-.", "BS": ":",
+      "Verlet": (0, (5, 1))}
 
 
 def null_initial_conditions(blackhole, r0=R0, b=B):
@@ -77,13 +90,30 @@ def _paper_rc():
     })
 
 
-def run_all(blackhole, y0):
+def trace_one(blackhole, y0, method):
+    """Trace a single captured geodesic with ``method``; return (T, Y).
+
+    Integration stops just outside the horizon (R_STOP) to avoid the
+    coordinate singularity.
+    """
     rhs = lambda lam, q: blackhole.geodesics(q, lam)
+    stop = lambda t, y: y[1] <= R_STOP
+    if method in ("DP45", "CK45", "RKF45"):
+        return integrator.rk_adaptive(rhs, 0.0, y0, LAMBDA_MAX, method=method,
+                                      atol=ATOL, rtol=RTOL, stop=stop)
+    if method == "BS":
+        return integrator.bulirsch_stoer(rhs, 0.0, y0, LAMBDA_MAX,
+                                         atol=ATOL, rtol=RTOL, stop=stop)
+    if method == "Verlet":
+        return integrator.verlet(rhs, 0.0, y0, LAMBDA_MAX,
+                                 n_steps=VERLET_STEPS, stop=stop)
+    raise ValueError(method)
+
+
+def run_all(blackhole, y0):
     out = {}
-    for m in pm.METHODS:
-        T, Y = pm.integrate_photon(rhs, y0, (0.0, LAMBDA_MAX), m,
-                                   atol=ATOL, rtol=RTOL, r_stop=R_STOP,
-                                   verlet_steps=VERLET_STEPS)
+    for m in METHODS:
+        T, Y = trace_one(blackhole, y0, m)
         out[m] = (T, np.abs(Hamiltonian(Y, blackhole)), len(T) - 1)
     return out
 
@@ -102,24 +132,27 @@ def main():
 
     results = run_all(blackhole, y0)
 
-    print(f"{'method':<32}{'steps':>8}{'max|H|':>14}{'final|H|':>14}")
-    print("-" * 68)
-    for m in pm.METHODS:
+    print(f"{'method':<18}{'steps':>8}{'max|H|':>14}{'final|H|':>14}")
+    print("-" * 54)
+    for m in METHODS:
         lam, H, nsteps = results[m]
-        print(f"{pm.NICE[m]:<32}{nsteps:>8}{H.max():>14.3e}{H[-1]:>14.3e}")
+        print(f"{NICE[m]:<18}{nsteps:>8}{H.max():>14.3e}{H[-1]:>14.3e}")
     print()
 
     _paper_rc()
 
     fig, ax = plt.subplots(figsize=(6, 4.5), constrained_layout=True)
-    for m in pm.METHODS:
+    for m in METHODS:
         lam, H, _ = results[m]
-        ax.semilogy(lam, np.clip(H, 1e-18, None), color=pm.COLOR[m], lw=1.5,
-                    label=pm.NICE[m])
+        ax.semilogy(lam, np.clip(H, 1e-18, None), color=COLOR[m], lw=1.5,
+                    linestyle=LS[m], label=NICE[m])
+    ax.set_xlim(0, max(results[m][0][-1] for m in METHODS))
     ax.set_xlabel(r"$\lambda$")
     ax.set_ylabel(r"$|H|$")
-    ax.grid(visible=True, which="both")
-    ax.legend(loc="upper right", frameon=True)
+    ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1,
+                                          numticks=500))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.legend(loc="lower right", frameon=True)
     fig.savefig(f"images/{SAVENAME}_overlay.png", dpi=300, bbox_inches="tight")
 
     print(f"Saved: images/{SAVENAME}_overlay.png")

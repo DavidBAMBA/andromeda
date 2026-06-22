@@ -354,3 +354,155 @@ def _solve_verlet(f, y0, span, events, max_step, first_step, max_steps):
         method="Verlet",
         success=True,
     )
+
+
+# ----------------------------------------------------------------------------
+# Tao (2016) explicit symplectic leapfrog in extended phase space
+# ----------------------------------------------------------------------------
+
+def _solve_tao(f, y0, span, events, max_step, first_step, max_steps, omega=None):
+    """
+    Tao [Phys. Rev. E 94, 043303 (2016)] explicit symplectic leapfrog for the
+    non-separable geodesic Hamiltonian H(q, p) = 1/2 g^{ab}(q) p_a p_b.
+
+    Duplicate the canonical state (q, p) -> (q, p, x, w) and Strang-compose
+    three exactly-solvable flows of the extended Hamiltonian
+        Hbar = H(q, w) + H(x, p) + (omega/2)(|q - x|^2 + |p - w|^2):
+        phi_A^{h/2} . phi_B^{h/2} . phi_C^{h} . phi_B^{h/2} . phi_A^{h/2}
+    phi_A/phi_B reuse the canonical RHS f(., (Q,P)) = (dH/dp, -dH/dq); phi_C
+    is the closed-form rotation of (q-x, p-w) by angle 2 omega h. Explicit,
+    time-symmetric and symplectic in the extended phase space. State layout
+    must be canonical: positions y[:d], conjugate momenta y[d:] (even dim).
+    The reported state is the mean of the two copies.
+    """
+    t0, t1 = span
+    forward = t1 >= t0
+    sgn = 1.0 if forward else -1.0
+
+    y = asarray(y0, dtype=float)
+    n = y.size
+    if n % 2:
+        raise ValueError("Tao requires a canonical state of even dimension "
+                         "(positions in y[:d], momenta in y[d:]).")
+    d = n // 2
+    t = float(t0)
+
+    if first_step is not None:
+        h = abs(first_step) * sgn
+    elif max_step is not None:
+        h = abs(max_step) * sgn
+    else:
+        h = (t1 - t0) / 10_000
+    om = (1.0 / abs(h)) if omega is None else float(omega)
+
+    counter = [0]
+    def ff(tt, yy):
+        counter[0] += 1
+        return asarray(f(tt, yy), dtype=float)
+
+    # Two copies; second starts equal to the first.
+    q = y[:d].copy(); p = y[d:].copy()
+    x = q.copy();     w = p.copy()
+
+    def project():
+        return np.concatenate((0.5 * (q + x), 0.5 * (p + w)))
+
+    y = project()
+    prev_g = [float(ev(t, y)) for ev in events] if events else []
+    T_out = [t]
+    Y_out = [y.copy()]
+    t_events = [[] for _ in events]
+    y_events = [[] for _ in events]
+    status = "max_lambda"
+    accepted = 0
+
+    def done(tt):
+        return tt >= t1 if forward else tt <= t1
+
+    while not done(t) and accepted < max_steps:
+        if forward and t + h > t1:
+            h = t1 - t
+        if (not forward) and t + h < t1:
+            h = t1 - t
+        hh = 0.5 * h
+
+        # phi_A^{h/2}
+        fa = ff(t, np.concatenate((q, w)))
+        x = x + hh * fa[:d]; p = p + hh * fa[d:]
+        # phi_B^{h/2}
+        fb = ff(t, np.concatenate((x, p)))
+        q = q + hh * fb[:d]; w = w + hh * fb[d:]
+        # phi_C^{h}: closed-form rotation of the copy differences
+        c = cos(2.0 * om * h); s = np.sin(2.0 * om * h)
+        sq = q + x; sp = p + w
+        dq = q - x; dp = p - w
+        dq2 =  c * dq + s * dp
+        dp2 = -s * dq + c * dp
+        q = 0.5 * (sq + dq2); x = 0.5 * (sq - dq2)
+        p = 0.5 * (sp + dp2); w = 0.5 * (sp - dp2)
+        # phi_B^{h/2}
+        fb = ff(t, np.concatenate((x, p)))
+        q = q + hh * fb[:d]; w = w + hh * fb[d:]
+        # phi_A^{h/2}
+        fa = ff(t, np.concatenate((q, w)))
+        x = x + hh * fa[:d]; p = p + hh * fa[d:]
+
+        t_new = t + h
+        y_new = np.concatenate((0.5 * (q + x), 0.5 * (p + w)))
+        if not all(isfinite(v) for v in y_new):
+            status = "nonfinite"
+            break
+
+        event_hit = None
+        if events:
+            def interp(s):
+                return y + s * (y_new - y)
+
+            new_g = [float(ev(t_new, y_new)) for ev in events]
+            for idx, (g_old, g_new, ev) in enumerate(zip(prev_g, new_g, events)):
+                direction = getattr(ev, "direction", 0)
+                if g_old * g_new < 0.0:
+                    if direction == 1 and g_old >= 0.0:
+                        continue
+                    if direction == -1 and g_old <= 0.0:
+                        continue
+                    try:
+                        s_star = brentq(
+                            lambda s, ev=ev: float(ev(t + s * h, interp(s))),
+                            0.0, 1.0, xtol=1e-12, rtol=1e-12
+                        )
+                    except ValueError:
+                        s_star = 1.0
+                    t_star = t + s_star * h
+                    y_star = interp(s_star)
+                    t_events[idx].append(t_star)
+                    y_events[idx].append(y_star)
+                    if getattr(ev, "terminal", True):
+                        event_hit = (idx, t_star, y_star)
+                        break
+
+        if event_hit is not None:
+            idx, t_star, y_star = event_hit
+            T_out.append(t_star)
+            Y_out.append(y_star)
+            status = getattr(events[idx], "name", f"event_{idx}")
+            break
+
+        T_out.append(t_new)
+        Y_out.append(y_new)
+        t, y = t_new, y_new
+        if events:
+            prev_g = new_g
+        accepted += 1
+
+    return IntegrationResult(
+        t=array(T_out),
+        y=array(Y_out),
+        t_events=[array(te) for te in t_events],
+        y_events=[array(ye) if ye else array([]).reshape(0, n) for ye in y_events],
+        status=status,
+        nfev=counter[0],
+        wall_time=0.0,
+        method="Tao",
+        success=True,
+    )

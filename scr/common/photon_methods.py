@@ -22,13 +22,13 @@ from scr.common import integrator
 
 # legend labels + a stable color per method
 NICE = {
-    "LSODA": "LSODA (scipy)",
-    "DOP853": "DOP853 (scipy)",
-    "RK45": "RK45 (Dormand-Prince, in-house)",
-    "Verlet": "Verlet (symmetric midpoint)",
+    "LSODA": "LSODA",
+    "DOP853": "DOP853",
+    "RK45": "RK45",
+    "Verlet": "Verlet",
 }
-COLOR = {"LSODA": "tab:purple", "DOP853": "tab:orange",
-         "RK45": "tab:blue", "Verlet": "tab:green"}
+COLOR = {"LSODA": "#A07BC8", "DOP853": "#E0956B",
+         "RK45": "#5E96C8", "Verlet": "#6CB48A"}
 METHODS = ["LSODA", "DOP853", "RK45", "Verlet"]
 
 

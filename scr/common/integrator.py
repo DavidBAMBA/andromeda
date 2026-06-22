@@ -10,7 +10,9 @@ Backends:
     - "LSODA"  : scipy.integrate.solve_ivp with LSODA
     - "DOP853" : scipy.integrate.solve_ivp with DOP853
     - "RK45"   : in-house adaptive Dormand-Prince with Brent event refinement
-    - "Verlet" : 2nd-order Strang splitting (experimental)
+    - "Verlet" : 2nd-order midpoint splitting (RK2; not symplectic)
+    - "Tao"    : 2nd-order explicit symplectic leapfrog (Tao 2016, extended
+                 phase space) for the non-separable geodesic Hamiltonian
 
 Events:
     Each event is a callable g(lmbda, y) -> float. Integration stops at the
@@ -21,7 +23,8 @@ Events:
 from numpy import cos
 
 from scr.common._solvers import (IntegrationResult,
-                                  _solve_scipy, _solve_rk45, _solve_verlet)
+                                  _solve_scipy, _solve_rk45, _solve_verlet,
+                                  _solve_tao)
 from scr.common._numba_kernels import (_null_omega_nb, _solve_photon_nb,
                                         _compute_pixel_nb, _render_image_nb)
 
@@ -38,9 +41,9 @@ def integrate(f, y0, lmbda_span, *, method="DOP853", events=None,
     """
     Integrate y'(lmbda) = f(lmbda, y) over lmbda_span (backward allowed).
 
-    method  : "LSODA" | "DOP853" | "RK45" | "Verlet"
+    method  : "LSODA" | "DOP853" | "RK45" | "Verlet" | "Tao"
     events  : callables g(lmbda, y) -> float with .terminal and .direction attrs.
-    rtol/atol ignored by Verlet (fixed step).
+    rtol/atol ignored by Verlet/Tao (fixed step).
 
     Returns IntegrationResult(t, y, t_events, y_events, status, nfev, wall_time).
     """
@@ -63,6 +66,9 @@ def integrate(f, y0, lmbda_span, *, method="DOP853", events=None,
     elif method == "Verlet":
         result = _solve_verlet(f, y0, (t0, t1), events, max_step,
                                first_step, max_steps)
+    elif method == "Tao":
+        result = _solve_tao(f, y0, (t0, t1), events, max_step,
+                            first_step, max_steps)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -371,6 +377,113 @@ def verlet(f, t0, y0, t1, *, n_steps=10000, h0=None, max_steps=2_000_000,
         k2 = np.asarray(f(t + 0.5 * h, y_mid), float)
         y = y + h * k2
         t += h
+        T.append(t)
+        Y.append(y.copy())
+        steps += 1
+        if stop is not None and stop(t, y):
+            break
+    return np.asarray(T), np.asarray(Y)
+
+
+def tao(f, t0, y0, t1, *, n_steps=10000, h0=None, omega=None,
+        max_steps=2_000_000, stop=None, readout="mean"):
+    """Tao (2016) explicit symplectic leapfrog in an extended phase space.
+
+    Built for the *non-separable* geodesic Hamiltonian
+    H(q, p) = 1/2 g^{ab}(q) p_a p_b, where a naive Verlet/leapfrog does not
+    apply. Following Tao [Phys. Rev. E 94, 043303 (2016)], the phase space
+    (q, p) is duplicated into (q, p, x, w) and the extended Hamiltonian
+
+        Hbar = H(q, w) + H(x, p) + (omega/2) (|q - x|^2 + |p - w|^2)
+
+    is integrated by a symmetric Strang composition of three *exactly*
+    solvable flows:
+
+        phi_A^{h/2} . phi_B^{h/2} . phi_C^{h} . phi_B^{h/2} . phi_A^{h/2}
+
+    phi_A and phi_B reuse the existing canonical RHS directly (no extra
+    gradients), since f(., (Q, P)) = (dH/dp(Q,P), -dH/dq(Q,P)):
+
+        phi_A (freeze q, w; advance x, p):  fa = f(., (q, w))
+                                            x += dt fa[:d];  p += dt fa[d:]
+        phi_B (freeze x, p; advance q, w):  fb = f(., (x, p))
+                                            q += dt fb[:d];  w += dt fb[d:]
+
+    phi_C is the closed-form rotation of (q - x, p - w) by angle 2 omega h
+    (the sums q + x, p + w are invariant).
+
+    The scheme is explicit, time-symmetric and symplectic *in the extended
+    phase space*; omega binds the two copies and is tuned empirically (it
+    does not change the order, only the constraint drift). State layout must
+    be canonical: positions in y[:d], conjugate momenta in y[d:] (even dim).
+
+    Parameters
+    ----------
+    omega : float, optional
+        Binding constant. Defaults to 1/|h| (rotation angle ~2 rad/step).
+    readout : {"mean", "copy"}
+        Physical state reported per step: the mean of the two copies
+        ((q+x)/2, (p+w)/2) (default, better constraint adherence) or the
+        first copy (q, p).
+
+    Returns (T, Y) numpy arrays of the steps, same layout as ``verlet``.
+    """
+    y = np.asarray(y0, float).copy()
+    n = y.size
+    if n % 2:
+        raise ValueError("Tao requires a canonical state of even dimension "
+                         "(positions in y[:d], momenta in y[d:]).")
+    d = n // 2
+
+    t = float(t0)
+    t_end = float(t1)
+    forward = t_end >= t
+    sgn = 1.0 if forward else -1.0
+    h = abs(h0) * sgn if h0 is not None else (t_end - t) / n_steps
+    om = (1.0 / abs(h)) if omega is None else float(omega)
+
+    # Two copies of phase space; second copy starts equal to the first.
+    q = y[:d].copy(); p = y[d:].copy()
+    x = q.copy();     w = p.copy()
+
+    def project():
+        if readout == "mean":
+            return np.concatenate((0.5 * (q + x), 0.5 * (p + w)))
+        return np.concatenate((q, p))
+
+    T = [t]
+    Y = [y.copy()]
+    steps = 0
+    while (t < t_end if forward else t > t_end) and steps < max_steps:
+        if forward and t + h > t_end:
+            h = t_end - t
+        elif (not forward) and t + h < t_end:
+            h = t_end - t
+        hh = 0.5 * h
+
+        # phi_A^{h/2}
+        fa = np.asarray(f(t, np.concatenate((q, w))), float)
+        x = x + hh * fa[:d]; p = p + hh * fa[d:]
+        # phi_B^{h/2}
+        fb = np.asarray(f(t, np.concatenate((x, p))), float)
+        q = q + hh * fb[:d]; w = w + hh * fb[d:]
+        # phi_C^{h}: closed-form rotation of the copy differences
+        c = np.cos(2.0 * om * h); s = np.sin(2.0 * om * h)
+        sq = q + x; sp = p + w
+        dq = q - x; dp = p - w
+        dq2 =  c * dq + s * dp
+        dp2 = -s * dq + c * dp
+        q = 0.5 * (sq + dq2); x = 0.5 * (sq - dq2)
+        p = 0.5 * (sp + dp2); w = 0.5 * (sp - dp2)
+        # phi_B^{h/2}
+        fb = np.asarray(f(t, np.concatenate((x, p))), float)
+        q = q + hh * fb[:d]; w = w + hh * fb[d:]
+        # phi_A^{h/2}
+        fa = np.asarray(f(t, np.concatenate((q, w))), float)
+        x = x + hh * fa[:d]; p = p + hh * fa[d:]
+
+        t += h
+        y = project()
         T.append(t)
         Y.append(y.copy())
         steps += 1
