@@ -4,7 +4,11 @@ ex26 - Strong-scaling benchmark (Schwarzschild shadow, RKDP45 Numba kernel)
 ===============================================================================
 Thread strong-scaling of the production integrator (RKDP45, the Numba
 Dormand-Prince kernel) on a fixed 1024^2 Schwarzschild shadow: speedup
-S = T_1/T_p and efficiency E = S/p for p = 1..16 threads.
+S = T_1/T_p and efficiency E = S/p for p = 1..32 threads.
+
+Note: efficiency past the number of *physical* cores reflects SMT (two
+logical threads sharing one FP unit) and all-core boost throttling, not a
+defect of the kernel -- the prange render is embarrassingly parallel.
 
 Parallel efficiency is essentially integrator-independent (the prange splits
 pixels the same way for every method), so a single representative production
@@ -35,8 +39,9 @@ ATOL = RTOL = 1e-9
 PROD = "DP45"               # production parallel integrator (numba Dormand-Prince)
 
 S2_RES = 1024
-S2_THREADS = [1, 2, 4, 8, 16]
+S2_THREADS = [1, 2, 4, 8, 16, 24, 32]
 S2_REPS = 3                 # best-of-N per measurement
+S2_COOLDOWN = 3.0           # seconds between thread counts (let clocks settle)
 
 NICE = {"DP45": "RKDP45"}
 COLOR = {"DP45": "#5E96C8"}
@@ -80,9 +85,15 @@ def study2_strong():
     print(f"STRONG SCALING - {PROD} (production), {S2_RES}^2 px, best-of-{S2_REPS}")
     print("=" * 70)
     al, be = grid(S2_RES)
+    max_p = gn.config.NUMBA_NUM_THREADS
+    threads = [p for p in S2_THREADS if p <= max_p]
+    if threads != list(S2_THREADS):
+        print(f"  NOTE: capping at NUMBA_NUM_THREADS={max_p} "
+              f"(requested up to {S2_THREADS[-1]}). On SLURM, request a node "
+              f"with >= {S2_THREADS[-1]} cores or set NUMBA_NUM_THREADS.")
     t1 = None
     sp, ef, tt = [], [], []
-    for p in S2_THREADS:
+    for p in threads:
         best = min(gn.render_shadow_numba(al, be, D=D, iota=IOTA, method=PROD,
                                           nthreads=p, atol=ATOL, rtol=RTOL)[2]
                    for _ in range(S2_REPS))
@@ -92,7 +103,8 @@ def study2_strong():
         sp.append(t1 / best)
         ef.append(100 * t1 / best / p)
         print(f"  threads={p:2d}  time={best:7.3f}s  speedup={sp[-1]:5.2f}x  eff={ef[-1]:4.0f}%")
-    return S2_THREADS, tt, sp, ef
+        time.sleep(S2_COOLDOWN)     # thermal cooldown so T_1 isn't boost-inflated vs T_p
+    return threads, tt, sp, ef
 
 
 def make_plot(s2):
@@ -100,19 +112,20 @@ def make_plot(s2):
     th2, _, sp2, ef2 = s2
 
     fig, (axa, axb) = plt.subplots(1, 2, figsize=(9, 4.5), constrained_layout=True)
+    xmax = max(th2) + 1
     axa.plot(th2, sp2, "o-", color=COLOR[PROD], label=NICE[PROD])
     axa.plot(th2, th2, "k:", lw=1, label="ideal linear")
     axa.set_xlabel("workers")
     axa.set_ylabel(r"speedup  $S = T_1/T_p$")
-    axa.set_xlim(1, 17)
-    axa.legend(loc="lower right", frameon=True)
+    axa.set_xlim(1, xmax)
+    axa.legend(loc="upper left", frameon=True)
 
     axb.plot(th2, ef2, "o-", color=COLOR[PROD], label=NICE[PROD])
     axb.axhline(100, color="k", ls=":", lw=0.8)
     axb.set_xlabel("workers")
     axb.set_ylabel(r"efficiency  $E = S/p$  [%]")
-    axb.set_xlim(1, 17)
-    axb.legend(loc="lower right", frameon=True)
+    axb.set_xlim(1, xmax)
+    axb.legend(loc="upper right", frameon=True)
 
     fig.savefig("images/bench_strong_scaling.png", dpi=300, bbox_inches="tight")
     print("\nSaved: images/bench_strong_scaling.png")
